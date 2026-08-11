@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - '@react-three/drei@10.7.8'

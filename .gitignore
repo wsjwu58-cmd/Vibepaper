@@ -1,0 +1,73 @@
+# --- Dependencies & virtualenvs ---
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pnpm-store/
+
+# --- Build outputs ---
+dist/
+dist-ssr/
+build/
+target/
+*.class
+*.jar
+!**/src/**/lib/*.jar
+.turbo/
+*.tsbuildinfo
+
+# --- Local data, logs, caches ---
+data/
+logs/
+*.log
+*.err.log
+**/build*.log
+**/install*.log
+**/repackage*.log
+**/cv.log
+**/ent.log
+**/gw.log
+.cache/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+coverage/
+htmlcov/
+.nyc_output/
+
+# --- Secrets & local env ---
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+credentials.json
+**/application-local.yml
+**/application-local.yaml
+
+# --- IDE / OS ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.iml
+.DS_Store
+Thumbs.db
+*.suo
+*.sw?
+
+# --- Tooling / scratch (not part of product source) ---
+.codegraph/
+.firecrawl/
+.workbuddy/
+.trae-html-share-packages/
+agent-design-optimization/
+agent-test-framework/
+resume-highlights/
+
+# --- Misc ---
+*.local
+.cursor/
