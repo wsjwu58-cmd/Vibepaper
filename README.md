@@ -147,4 +147,4 @@ pnpm dev   # http://localhost:5173
 
 ## License
 
-暂未选定开源协议。使用或二次分发前请先联系仓库维护者。
+[MIT](./LICENSE) © 2026 ShiJie Wu
