@@ -190,11 +190,12 @@ export function NodeFloatingToolbar({
   const [busy, setBusy] = useState(false)
   const [menu, setMenu] = useState<'crop' | 'upscale' | 'three' | null>(null)
   const imageModel =
-    models.find((m) => m.modelType === 'image' && /seedream/i.test(m.name))?.name ??
+    models.find((m) => m.modelType === 'image' && /agnes-image/i.test(m.name))?.name ??
+    models.find((m) => m.modelType === 'image' && /agnes|seedream/i.test(m.name))?.name ??
     models.find((m) => m.modelType === 'image')?.name
   const videoModel =
-    models.find((m) => m.modelType === 'video' && /seedance-1-0-pro/i.test(m.name))?.name ??
-    models.find((m) => m.modelType === 'video' && /seedance/i.test(m.name))?.name ??
+    models.find((m) => m.modelType === 'video' && /agnes-video/i.test(m.name))?.name ??
+    models.find((m) => m.modelType === 'video' && /agnes|seedance/i.test(m.name))?.name ??
     models.find((m) => m.modelType === 'video')?.name
 
   const runOp = async (op: string, extra: Record<string, unknown> = {}) => {
@@ -461,10 +462,16 @@ export function NodeEditorDialog({
   const [err, setErr] = useState('')
   const promptRef = useRef<HTMLTextAreaElement>(null)
 
-  const typeModels = models.filter((m) => m.modelType === node.type)
+  const typeModels = useMemo(
+    () =>
+      models.filter(
+        (m) => m.modelType === node.type && !/兼容别名|已停用/.test(String(m.description || '')),
+      ),
+    [models, node.type],
+  )
   const preferred =
-    typeModels.find((m) => /seedream-5-0(?!-pro)|seedance-1-0-pro/i.test(m.name))?.name ??
-    typeModels.find((m) => /seedream|seedance/i.test(m.name))?.name ??
+    typeModels.find((m) => /agnes-image|agnes-video/i.test(m.name))?.name ??
+    typeModels.find((m) => /agnes|seedream|seedance/i.test(m.name))?.name ??
     typeModels[0]?.name
 
   // 上游变化时合并进参考（保留本地上传；尊重用户删除的上游）
@@ -480,8 +487,10 @@ export function NodeEditorDialog({
 
   useEffect(() => {
     setPrompt((node.params.prompt as string) ?? '')
-    setModel((node.params.model as string) || preferred || '')
-  }, [node.id, node.params.prompt, node.params.model, preferred])
+    const raw = (node.params.model as string) || preferred || ''
+    const allowed = typeModels.some((m) => m.name === raw) ? raw : preferred || ''
+    setModel(allowed)
+  }, [node.id, node.params.prompt, node.params.model, preferred, typeModels])
 
   useEffect(() => {
     if (!autoFocusPrompt) return
@@ -584,20 +593,36 @@ export function NodeEditorDialog({
       }
       const resolution = RES_MAP[resKey] || '1024x1024'
       const outputCount = isSplitLayout && node.type === 'text' ? count : 1
+      let finalPrompt = effectivePrompt
+      if (node.type === 'video' && firstFrame?.url) {
+        const fidelity =
+          '严格保持与参考首帧同一主体、构图、服装与色调；只描述运动与镜头变化，勿重新创造形象。'
+        if (!finalPrompt.includes('严格保持与参考首帧')) {
+          finalPrompt = finalPrompt.trim() ? `${finalPrompt.trim()}\n${fidelity}` : fidelity
+        }
+      } else if (node.type === 'image' && refUrls.length > 0) {
+        const fidelity =
+          '严格参考输入图片的主体、构图与风格，仅按提示词做有限调整，勿整体重绘成另一张图。'
+        if (!finalPrompt.includes('严格参考输入图片')) {
+          finalPrompt = finalPrompt.trim() ? `${finalPrompt.trim()}\n${fidelity}` : fidelity
+        }
+      }
       await submitNodeTask(
         node.id,
         model || preferred || node.type,
         {
-          prompt: effectivePrompt,
+          prompt: finalPrompt,
           resolution,
           aspect,
           style,
           camera,
           count: outputCount,
           referenceUrls: refUrls,
+          referenceImages: refUrls.filter(Boolean),
           referenceTexts: refTexts,
           firstFrameUrl: firstFrame?.url,
           lastFrameUrl: lastFrame?.url,
+          imageUrl: firstFrame?.kind === 'image' ? firstFrame.url : undefined,
           upstreamNodeIds: refsForUi.map((r) => r.sourceNodeId).filter(Boolean),
         },
         10,

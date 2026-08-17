@@ -37,41 +37,37 @@ def test_extract_visual_goal_keeps_subject():
     assert "赛博朋克" in extract_visual_goal("画一张赛博朋克风格的城市夜景海报")
 
 
-def test_per_node_prompts_differ_from_user_input():
+def test_per_node_prompts_use_theme_not_shell():
+    """不再注入「请直接写出…」空模板壳；方向来自用户主题。"""
     user = "做一个30秒短剧，3个镜头，主角是穿铠甲的狼"
     script = build_node_prompt(role="script", user_theme=user)
     shot = build_node_prompt(role="shot", user_theme=user, shot_count=3)
     kf = build_node_prompt(role="keyframe", user_theme=user, shot_index=1, shot_count=3)
     clip = build_node_prompt(role="clip", user_theme=user, shot_index=1, shot_count=3)
-    assert user != script
-    assert user != shot
-    assert user != kf
-    assert "分镜" in shot or "镜头" in shot
-    assert "首帧" in kf or "静帧" in kf
-    # 方向来自用户；脚本简报要带主体
+    assert "请直接写出" not in script
+    assert "请直接写出" not in shot
     assert "铠甲" in script or "狼" in script
-    # 视频 Prompt 只写运镜/动作，不复述外貌长文
-    assert "运镜" in clip or "拉远" in clip or "推近" in clip or "跟拍" in clip
-    assert "不要复述" in clip or "延续首帧" in clip
+    assert "拆成" in shot or "镜" in shot
+    assert "镜头" in kf
+    assert "运镜" in clip or "推近" in clip or "跟拍" in clip or "微动" in clip
 
 
-def test_prompt_philosophy_layers():
-    """用户定方向、Prompt 定本次动作；clip 不粘贴整段故事。"""
+def test_prompt_philosophy_no_empty_shell():
+    """用户定方向；空模板壳已下线。"""
     user = "按照工作流生成橘猫和恶狼的短剧"
     script = build_node_prompt(role="script", user_theme=user)
     clip = build_node_prompt(role="clip", user_theme=user, shot_index=2, shot_count=3)
     assert "橘猫" in script and "恶狼" in script
-    assert not script.startswith("【总脚本】\n主题：")
-    assert "请直接写出" in script or "正文" in script
-    assert "复述角色外貌" in clip or "不要复述" in clip
-    assert user not in clip
+    assert "请直接写出" not in script
+    assert not script.startswith("【总脚本】")
+    assert ("运镜" in clip) or ("推近" in clip) or ("微动" in clip) or ("首帧" in clip)
 
 
-def test_prompt_for_media_create_not_verbatim():
+def test_prompt_for_media_create_keeps_subject():
     user = "画一张赛博朋克风格的城市夜景海报"
     prompt = prompt_for_media_create(user, "image", "keyframe")
-    assert prompt != user
-    assert len(prompt) >= 20
+    assert "请直接写出" not in prompt
+    assert len(prompt) >= 8
     assert "赛博朋克" in prompt or "城市" in prompt
 
 
@@ -160,6 +156,18 @@ def test_plan_downstream_after_script():
     assert actions[0].params["node_id"] == 2
 
 
+def test_plan_downstream_does_not_fallback_to_unrelated_nodes():
+    """完成节点没有直接下游时，不得把画布上所有 idle 节点都提交一遍。"""
+    nodes = [
+        {"id": 1, "type": "text", "creativeType": "script", "execStatus": "ready"},
+        {"id": 9, "type": "image", "creativeType": "keyframe", "execStatus": "idle"},
+        {"id": 10, "type": "image", "creativeType": "keyframe", "execStatus": "stale"},
+    ]
+    edges = []
+    actions = plan_downstream_submits({"nodes": nodes, "edges": edges}, completed_node_id=1)
+    assert actions == []
+
+
 def test_image_then_video_pipeline_prompts_and_deps():
     from agent.agent.planner import plan, _is_image_then_video
 
@@ -192,9 +200,9 @@ def test_image_to_video_waits_for_upstream():
     assert len(submits) == 0
 
 
-def test_default_video_model_is_seedance_10_pro():
+def test_default_video_model_is_pref_model():
     from agent.domain.video_task import DEFAULT_VIDEO_MODEL, resolve_video_model_name
+    from agent.domain.workflow_rails import VIDEO_PREF_MODEL
 
-    assert "1-0-pro" in DEFAULT_VIDEO_MODEL
-    assert "1-5" not in resolve_video_model_name(None)
-    assert "1-0-pro" in resolve_video_model_name(None) or resolve_video_model_name(None) == DEFAULT_VIDEO_MODEL
+    assert DEFAULT_VIDEO_MODEL == VIDEO_PREF_MODEL
+    assert resolve_video_model_name(None) == VIDEO_PREF_MODEL or VIDEO_PREF_MODEL in resolve_video_model_name(None)

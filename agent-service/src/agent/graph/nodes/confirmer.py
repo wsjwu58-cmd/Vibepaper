@@ -25,14 +25,12 @@ def confirmer_node(state: AgentState) -> dict:
     action = pending[0]
     if action.get("confirm_reason") == "contract_violation" or action.get("status") == "blocked":
         err = (state.get("contract_violations") or [{}])[0].get("error", "创作契约校验未通过")
-        events = list(state.get("events") or [])
-        events.append({"type": "contract_blocked", "tool": action.get("tool_name"), "error": err})
         return {
             "confirm_accept": False,
             "executable_actions": [],
             "pending_high_risk": [],
             "reply": err,
-            "events": events,
+            "events": [{"type": "contract_blocked", "tool": action.get("tool_name"), "error": err}],
         }
 
     action_id = int(action.get("action_id") or _next_id())
@@ -106,7 +104,7 @@ def confirmer_node(state: AgentState) -> dict:
     }
     user_content = state.get("user_content") or ""
     auto_accept = should_auto_confirm(user_content, action["tool_name"])
-    events = list(state.get("events") or [])
+    events: list[dict] = []
 
     if auto_accept:
         accept = True
@@ -134,8 +132,25 @@ def confirmer_node(state: AgentState) -> dict:
         events.append(payload)
         decision = interrupt(payload)
         accept = bool(decision.get("accept")) if isinstance(decision, dict) else bool(decision)
+        confirmed = None
+        if isinstance(decision, dict):
+            confirmed = decision.get("confirmedAction") or decision.get("confirmed_action") or decision.get("params")
+            if confirmed is not None and not isinstance(confirmed, dict):
+                confirmed = None
         if accept:
             agent_confirm_accept(state["session_id"], action["tool_name"])
+            if confirmed:
+                from ...domain.precedence import apply_confirmed_action
+                params = apply_confirmed_action(params, confirmed)
+                action = {**action, "params": params}
+                db3 = SessionLocal()
+                try:
+                    rec = db3.get(AgentAction, action_id)
+                    if rec:
+                        rec.params = params
+                        db3.commit()
+                finally:
+                    db3.close()
         events.append({
             "type": "inline_confirm",
             "accepted": accept,
@@ -150,6 +165,9 @@ def confirmer_node(state: AgentState) -> dict:
             "executable_actions": list(state.get("executable_actions") or []) + to_run,
             "pending_high_risk": pending[1:],
             "pending_confirm": None if auto_accept else payload,
+            # HITL 恢复后禁止再进 ReAct continue，避免整流程重跑
+            "react_mode": False,
+            "react_decision": "finish",
             "events": events,
         }
     return {
@@ -157,6 +175,8 @@ def confirmer_node(state: AgentState) -> dict:
         "executable_actions": [],
         "pending_high_risk": [],
         "pending_confirm": payload,
+        "react_mode": False,
+        "react_decision": "finish",
         "reply": f"已取消操作：{action.get('summary') or action['tool_name']}",
         "events": events,
     }

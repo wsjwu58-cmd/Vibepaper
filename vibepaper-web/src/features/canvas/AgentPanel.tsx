@@ -5,33 +5,40 @@ import {
   Send,
   Settings2,
   BookOpen,
-  Plus,
   History,
   BarChart3,
-  Upload,
   Square,
   SquarePlus,
+  Plus,
   Puzzle,
   SlidersHorizontal,
   Lightbulb,
   ListTree,
   Megaphone,
 } from 'lucide-react'
-import { api, apiUrl } from '@/lib/api'
+import { api, authedFetch } from '@/lib/api'
 import { parseJsonPreserveIds } from '@/lib/ids'
 import { useAuth } from '@/lib/auth'
-import type { MemoryView, ModelInfo, SkillView } from '@/lib/types'
+import type { MemoryView, ModelInfo } from '@/lib/types'
+import { SkillsPanel } from './SkillsPanel'
 import { ModelPicker } from '@/components/ui/ModelPicker'
 import { useCanvasStore } from './canvasStore'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
 import { cn } from '@/lib/cn'
 import type { AgentChatMsg, AgentSuggestion, ExecutionStep } from './agentTypes'
-import { AgentExecutionRecord, AgentNextActions, AgentTaskBadge } from './AgentExecutionRecord'
+import { AgentNextActions, AgentTaskBadge, AgentTurnTimeline } from './AgentExecutionRecord'
 import { applyAgentEvent, isChatVisibleMessage, shouldRefreshCanvas } from './agentEventHandlers'
+import { AgentComposerBar, refFromNode, upsertRefs, type ComposerRef } from './AgentComposerBar'
 
 const AGENT_PANEL_DEFAULT_WIDTH = 380
 const AGENT_PANEL_MIN_WIDTH = 300
 const AGENT_PANEL_MAX_WIDTH = 720
+const DEFAULT_TEXT_MODEL = 'agnes-2.5-flash'
+
+function resolvePreferredTextModel(name?: string | null) {
+  if (!name || /deepseek|qwen-max|gpt-4o-mini/i.test(name)) return DEFAULT_TEXT_MODEL
+  return name
+}
 
 const SUGGESTIONS = [
   { icon: ListTree, text: '梳理画布信息，提炼核心创意与明确的下一步' },
@@ -67,7 +74,7 @@ export function AgentPanel() {
   const [resizing, setResizing] = useState(false)
   const resizeStartRef = useRef<{ x: number; w: number } | null>(null)
   const [textModels, setTextModels] = useState<ModelInfo[]>([])
-  const [agentModel, setAgentModel] = useState(preferences?.defaultTextModel || 'deepseek-v4-pro')
+  const [agentModel, setAgentModel] = useState(resolvePreferredTextModel(preferences?.defaultTextModel))
   const [sessionId, setSessionId] = useState<string | number | null>(null)
   const [sessionTitle, setSessionTitle] = useState('新对话')
   const [messages, setMessages] = useState<AgentChatMsg[]>([])
@@ -76,12 +83,21 @@ export function AgentPanel() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [tab, setTab] = useState<'chat' | 'pref' | 'skills' | 'usage' | 'history'>('chat')
   const [selectedNodes, setSelectedNodes] = useState<string[]>([])
+  const [composerRefs, setComposerRefs] = useState<ComposerRef[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
   const sseAbortRef = useRef<AbortController | null>(null)
   const sendAbortRef = useRef<AbortController | null>(null)
   const turnIdRef = useRef<string | null>(null)
   const seenTaskIdsRef = useRef<Set<string>>(new Set())
+  const seenWakeupRef = useRef<Map<string, number>>(new Map())
+  /** 本轮回复逐字动画标记 */
+  const [typingTurnId, setTypingTurnId] = useState<string | null>(null)
+  const busyRef = useRef(false)
   const canvasId = canvas?.canvas.id
+
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
 
   useEffect(() => {
     setAgentPanelWidth(open ? width : 0)
@@ -89,7 +105,7 @@ export function AgentPanel() {
 
   useEffect(() => {
     if (preferences?.defaultTextModel) {
-      setAgentModel(preferences.defaultTextModel)
+      setAgentModel(resolvePreferredTextModel(preferences.defaultTextModel))
     }
   }, [preferences?.defaultTextModel])
 
@@ -148,6 +164,12 @@ export function AgentPanel() {
     }
     if (ev.type === 'assistant_message') {
       const content = String(ev.content ?? '')
+      if (content) {
+        const last = seenWakeupRef.current.get(content)
+        const now = Date.now()
+        if (last && now - last < 60_000) return
+        seenWakeupRef.current.set(content, now)
+      }
       setMessages((prev) => {
         if (prev.some((m) => m.role === 'assistant' && m.content === content)) return prev
         return applyAgentEvent(prev, ev, turnIdRef.current)
@@ -170,6 +192,7 @@ export function AgentPanel() {
         .filter(isChatVisibleMessage),
     )
     setSuggestions([])
+    setComposerRefs([])
   }
 
   const ensureSession = async (forceNew = false) => {
@@ -205,6 +228,7 @@ export function AgentPanel() {
     setSessionTitle(s.title || '新对话')
     setMessages([])
     setSuggestions([])
+    setComposerRefs([])
     return s.sessionId
   }
 
@@ -221,8 +245,7 @@ export function AgentPanel() {
     sseAbortRef.current = ac
     void (async () => {
       try {
-        const res = await fetch(apiUrl(`/agent/sessions/${sessionId}/events`), {
-          headers: { Authorization: `Bearer ${localStorage.getItem('vp_access') ?? ''}` },
+        const res = await authedFetch(`/agent/sessions/${sessionId}/events`, {
           signal: ac.signal,
         })
         if (!res.ok || !res.body) return
@@ -258,12 +281,34 @@ export function AgentPanel() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, busy])
 
+  // busy 结束后若逐字已追上仍卡住标记，做兜底清理
   useEffect(() => {
-    const pick = (nodes: { selected?: boolean; id: string | number }[]) =>
-      nodes.filter((n) => n.selected).map((n) => String(n.id))
+    if (busy || !typingTurnId) return undefined
+    const msg = messages.find((m) => m.id === typingTurnId)
+    const len = msg?.content?.length ?? 0
+    const ms = Math.min(12000, Math.max(800, len * 20 + 400))
+    const t = window.setTimeout(() => {
+      setTypingTurnId((cur) => (cur === typingTurnId ? null : cur))
+    }, ms)
+    return () => window.clearTimeout(t)
+  }, [busy, typingTurnId, messages])
+
+  const canvasNodes = useCanvasStore((s) => s.nodes)
+
+  useEffect(() => {
+    const pick = (nodes: { selected?: boolean; id: string | number; data?: { node?: { id?: string | number } } }[]) =>
+      nodes.filter((n) => n.selected).map((n) => String(n.data?.node?.id ?? n.id))
     setSelectedNodes(pick(useCanvasStore.getState().nodes))
     const unsub = useCanvasStore.subscribe((s) => {
-      setSelectedNodes(pick(s.nodes))
+      const ids = pick(s.nodes)
+      setSelectedNodes(ids)
+      if (ids.length === 0) return
+      const add: ComposerRef[] = []
+      for (const n of s.nodes) {
+        if (!n.selected) continue
+        add.push(refFromNode(n.data.node))
+      }
+      if (add.length) setComposerRefs((prev) => upsertRefs(prev, add))
     })
     return unsub
   }, [])
@@ -310,12 +355,58 @@ export function AgentPanel() {
     setBusy(false)
   }
 
+  const pinNodesByIds = (ids: Array<string | number | undefined>) => {
+    const storeNodes = useCanvasStore.getState().nodes
+    const add: ComposerRef[] = []
+    for (const raw of ids) {
+      if (raw == null || raw === '') continue
+      const id = String(raw)
+      const hit = storeNodes.find((n) => String(n.data.node.id) === id || String(n.id) === id)
+      add.push(hit ? refFromNode(hit.data.node) : { id, kind: 'node', title: '节点' })
+    }
+    if (add.length) setComposerRefs((prev) => upsertRefs(prev, add))
+  }
+
   const processStreamEvent = (ev: Record<string, unknown>) => {
     if (shouldRefreshCanvas(ev)) {
       window.dispatchEvent(new Event('vp-agent-executed'))
     }
     if (ev.type === 'assistant_message') {
       if (Array.isArray(ev.suggestions)) setSuggestions(ev.suggestions as Suggestion[])
+      const tid = turnIdRef.current
+      if (tid && ev.content) setTypingTurnId(tid)
+      const skills = ev.loadedSkills as Array<string | { name?: string; key?: string }> | undefined
+      if (Array.isArray(skills) && skills.length) {
+        setComposerRefs((prev) =>
+          upsertRefs(
+            prev,
+            skills.map((s) => {
+              const name = typeof s === 'string' ? s : String(s?.name || s?.key || '')
+              return { id: `skill:${name}`, kind: 'skill' as const, title: name }
+            }).filter((s) => s.title),
+          ),
+        )
+      }
+    }
+    if (ev.type === 'skill_loaded') {
+      const name = String(ev.skill || '')
+      if (name && name !== 'paper-agent-default') {
+        setComposerRefs((prev) => upsertRefs(prev, [{ id: `skill:${name}`, kind: 'skill', title: name }]))
+      }
+    }
+    if (ev.type === 'canvas_changed' || (ev.type === 'action_result' && ev.tool === 'create_nodes' && ev.ok)) {
+      const data = (ev.data || {}) as Record<string, unknown>
+      const created = (data.createdNodes || data.nodes || []) as Array<{ id?: string | number }>
+      pinNodesByIds(created.map((n) => n.id))
+    }
+    if (ev.type === 'task_status') {
+      const data = (ev.data || {}) as Record<string, unknown>
+      if (String(data.status ?? '') === 'succeeded') {
+        pinNodesByIds([data.node_id as string | number | undefined, data.nodeId as string | number | undefined])
+      }
+    }
+    if ((ev.type === 'thinking' || ev.type === 'reflection') && turnIdRef.current) {
+      setTypingTurnId(turnIdRef.current)
     }
     setMessages((m) => applyAgentEvent(m, ev, turnIdRef.current))
   }
@@ -336,6 +427,8 @@ export function AgentPanel() {
     }
     const turnId = `turn-${Date.now()}`
     turnIdRef.current = turnId
+    // 本轮一开始就标记为「需要逐字」，避免等事件时已同批贴全文
+    setTypingTurnId(turnId)
     setMessages((m) => [
       ...m,
       { id: Date.now(), role: 'user', type: 'text', content },
@@ -352,15 +445,17 @@ export function AgentPanel() {
     try {
       const sid = await ensureSession()
       if (ac.signal.aborted) return
-      const res = await fetch(apiUrl(`/agent/sessions/${sid}/messages`), {
+      const res = await authedFetch(`/agent/sessions/${sid}/messages`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('vp_access') ?? ''}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content,
-          selectedNodeIds: selectedNodes,
+          selectedNodeIds: [
+            ...new Set([
+              ...selectedNodes,
+              ...composerRefs.filter((r) => r.kind === 'node').map((r) => r.id),
+            ]),
+          ],
           canvasId: canvas?.canvas.id != null ? String(canvas.canvas.id) : undefined,
         }),
         signal: ac.signal,
@@ -385,6 +480,8 @@ export function AgentPanel() {
           const ev = parseJsonPreserveIds(dataLine.slice(6)) as Record<string, unknown>
           if (ev.type === 'done') continue
           processStreamEvent(ev)
+          // 让出主线程，避免一整包事件被 React 批成一次渲染
+          await new Promise<void>((r) => setTimeout(r, 0))
         }
       }
       if (ac.signal.aborted) return
@@ -437,6 +534,7 @@ export function AgentPanel() {
         />
       </div>
       <div className="flex h-full flex-col" style={{ width }}>
+      {tab !== 'skills' && (
       <div className="flex items-center justify-between px-4 py-3.5">
         <div className="flex items-center gap-2.5">
           <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#111] text-white">
@@ -473,6 +571,7 @@ export function AgentPanel() {
           </button>
         </div>
       </div>
+      )}
 
       {tab === 'chat' && (
         <div className="flex min-h-0 flex-1 flex-col bg-[var(--canvas-surface)]">
@@ -509,36 +608,39 @@ export function AgentPanel() {
             )}
 
             {messages.filter(isChatVisibleMessage).map((m) => (
-              <div key={m.id} className={`mb-3 flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div key={m.id} className={`mb-4 flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div
                   className={cn(
-                    'max-w-[92%] px-3.5 py-2.5 text-[13px] leading-relaxed',
+                    'max-w-[94%] px-1 py-1',
                     m.role === 'user'
-                      ? 'rounded-[18px] whitespace-pre-line bg-[#efefef] text-[#111]'
-                      : 'text-[#333]',
+                      ? 'rounded-[18px] whitespace-pre-line bg-[#efefef] px-3.5 py-2.5 text-[15px] leading-[1.65] text-[#111]'
+                      : 'w-full min-w-0 text-[15px] leading-[1.7] text-[#222]',
                   )}
                 >
-                  {m.content ? (
-                    <p className="whitespace-pre-line">{m.content}</p>
-                  ) : busy && m.role === 'assistant' ? (
-                    <p className="text-[12px] text-[#999]">正在编排…</p>
-                  ) : null}
-                  {m.meta?.executionSteps && m.meta.executionSteps.length > 0 && (
-                    <AgentExecutionRecord steps={m.meta.executionSteps} defaultOpen />
-                  )}
-                  <AgentTaskBadge status={m.meta?.taskStatus?.status} taskId={m.meta?.taskStatus?.taskId} />
-                  {m.meta?.pipelineStage && m.role === 'assistant' && (
-                    <p className="mt-2 text-[10px] font-medium text-[#aaa]">
-                      创作阶段 · {m.meta.pipelineStage}
-                    </p>
-                  )}
-                  {m.meta?.nextActions && m.meta.nextActions.length > 0 && (
-                    <AgentNextActions
-                      actions={m.meta.nextActions}
-                      onPick={(text) => {
-                        setInput(text)
-                      }}
-                    />
+                  {m.role === 'assistant' ? (
+                    <>
+                      <AgentTurnTimeline
+                        steps={m.meta?.executionSteps ?? []}
+                        content={m.content}
+                        streaming={m.id === typingTurnId && busy}
+                        animateSpeech={m.id === typingTurnId}
+                        streamComplete={!busy && m.id === typingTurnId}
+                        onRevealDone={() => {
+                          setTypingTurnId((cur) => (cur === m.id ? null : cur))
+                        }}
+                      />
+                      <AgentTaskBadge status={m.meta?.taskStatus?.status} taskId={m.meta?.taskStatus?.taskId} />
+                      {m.meta?.nextActions && m.meta.nextActions.length > 0 && (
+                        <AgentNextActions
+                          actions={m.meta.nextActions}
+                          onPick={(text) => {
+                            setInput(text)
+                          }}
+                        />
+                      )}
+                    </>
+                  ) : (
+                    m.content
                   )}
                 </div>
               </div>
@@ -590,6 +692,13 @@ export function AgentPanel() {
               }}
             >
               <div className="relative rounded-lg border border-[var(--canvas-border)] bg-[color-mix(in_srgb,var(--canvas-surface)_88%,var(--canvas-surface-muted))] shadow-[0_8px_24px_rgba(15,23,42,0.08)] transition-colors focus-within:border-[var(--canvas-border-strong)] focus-within:ring-1 focus-within:ring-[var(--canvas-border)]">
+                <AgentComposerBar
+                  refs={composerRefs}
+                  nodes={canvasNodes}
+                  onRemove={(ref) =>
+                    setComposerRefs((prev) => prev.filter((x) => !(x.kind === ref.kind && x.id === ref.id)))
+                  }
+                />
                 <textarea
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
@@ -681,7 +790,17 @@ export function AgentPanel() {
       )}
 
       {tab === 'pref' && <PreferencesTab />}
-      {tab === 'skills' && <SkillsTab sessionId={sessionId} />}
+      {tab === 'skills' && (
+        <SkillsPanel
+          sessionId={sessionId}
+          onClose={() => setOpen(false)}
+          onBackToChat={() => setTab('chat')}
+          onApplied={(name) => {
+            if (!name) return
+            setComposerRefs((prev) => upsertRefs(prev, [{ id: `skill:${name}`, kind: 'skill', title: name }]))
+          }}
+        />
+      )}
       {tab === 'usage' && <UsageTab sessionId={sessionId} />}
       {tab === 'history' && (
         <HistoryTab
@@ -729,9 +848,9 @@ function PreferencesTab() {
   const updatePreferences = useAuth((s) => s.updatePreferences)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [pref, setPref] = useState({
-    text: preferences?.defaultTextModel || 'deepseek-v4-pro',
-    image: preferences?.defaultImageModel || 'doubao-seedream-5-0-260128',
-    video: preferences?.defaultVideoModel || 'doubao-seedance-1-0-pro-250528',
+    text: resolvePreferredTextModel(preferences?.defaultTextModel),
+    image: preferences?.defaultImageModel || 'agnes-image-2.1-flash',
+    video: preferences?.defaultVideoModel || 'agnes-video-v2.0',
     resolution: preferences?.defaultResolution || '1024x1024',
   })
   const [saving, setSaving] = useState(false)
@@ -744,14 +863,15 @@ function PreferencesTab() {
 
   useEffect(() => {
     setPref({
-      text: preferences?.defaultTextModel || 'deepseek-v4-pro',
-      image: preferences?.defaultImageModel || 'doubao-seedream-5-0-260128',
-      video: preferences?.defaultVideoModel || 'doubao-seedance-1-0-pro-250528',
+      text: resolvePreferredTextModel(preferences?.defaultTextModel),
+      image: preferences?.defaultImageModel || 'agnes-image-2.1-flash',
+      video: preferences?.defaultVideoModel || 'agnes-video-v2.0',
       resolution: preferences?.defaultResolution || '1024x1024',
     })
   }, [preferences])
 
-  const options = (type: string) => models.filter((m) => m.modelType === type)
+  const options = (type: string) =>
+    models.filter((m) => m.modelType === type && !/兼容别名|已停用/.test(String(m.description || '')))
 
   return (
     <div className="flex-1 space-y-3 overflow-auto p-4">
@@ -838,162 +958,6 @@ function Memories() {
           >
             <X size={12} />
           </button>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function SkillsTab({ sessionId }: { sessionId: string | number | null }) {
-  const [skills, setSkills] = useState<SkillView[]>([])
-  const [keyword, setKeyword] = useState('')
-  const [creating, setCreating] = useState<'blank' | 'chat' | null>(null)
-  const [draft, setDraft] = useState({ name: '', description: '', instructions: '' })
-  const fileRef = useRef<HTMLInputElement>(null)
-
-  const reload = () => {
-    void api<{ items: SkillView[] }>(`/skills${keyword ? `?keyword=${encodeURIComponent(keyword)}` : ''}`)
-      .then((r) => setSkills(r.items))
-      .catch(() => undefined)
-  }
-
-  useEffect(() => {
-    reload()
-  }, [keyword])
-
-  const createBlank = async () => {
-    try {
-      await api('/skills', {
-        method: 'POST',
-        body: JSON.stringify(draft),
-      })
-      toastSuccess('Skill 已创建')
-      setCreating(null)
-      setDraft({ name: '', description: '', instructions: '' })
-      reload()
-    } catch (e) {
-      toastError((e as Error).message)
-    }
-  }
-
-  const createFromChat = async () => {
-    if (!sessionId) {
-      toastError('请先打开一个对话')
-      return
-    }
-    try {
-      await api('/skills/from-conversation', {
-        method: 'POST',
-        body: JSON.stringify({ sessionId, name: draft.name || undefined }),
-      })
-      toastSuccess('已从对话生成 Skill')
-      setCreating(null)
-      reload()
-    } catch (e) {
-      toastError((e as Error).message)
-    }
-  }
-
-  const uploadSkill = async (file: File) => {
-    try {
-      const fd = new FormData()
-      fd.append('file', file)
-      const res = await fetch(apiUrl('/skills/upload'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('vp_access') ?? ''}` },
-        body: fd,
-      })
-      if (!res.ok) throw new Error('上传失败')
-      toastSuccess('Skill 文件已上传')
-      reload()
-    } catch (e) {
-      toastError((e as Error).message)
-    }
-  }
-
-  return (
-    <div className="flex-1 space-y-2 overflow-auto p-3">
-      <div className="flex gap-2">
-        <input
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-          placeholder="搜索 Skill"
-          className="h-9 flex-1 rounded-full border border-black/10 px-3 text-[12px]"
-        />
-        <button
-          onClick={() => setCreating('blank')}
-          className="flex h-9 items-center gap-1 rounded-full bg-[#111] px-3 text-[12px] font-bold text-white"
-        >
-          <Plus size={13} /> 新建
-        </button>
-      </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => setCreating('chat')}
-          className="h-8 flex-1 rounded-full border border-black/10 text-[11px] font-bold text-[#444]"
-        >
-          从当前对话生成
-        </button>
-        <button
-          onClick={() => fileRef.current?.click()}
-          className="flex h-8 flex-1 items-center justify-center gap-1 rounded-full border border-black/10 text-[11px] font-bold text-[#444]"
-        >
-          <Upload size={12} /> 上传 .md
-        </button>
-        <input ref={fileRef} type="file" accept=".md,.markdown" className="hidden" onChange={(e) => e.target.files?.[0] && void uploadSkill(e.target.files[0])} />
-      </div>
-      {creating && (
-        <div className="space-y-2 rounded-[18px] border border-black/8 bg-[#f7f7f7] p-2.5">
-          <input
-            value={draft.name}
-            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-            placeholder="Skill 名称"
-            className="h-9 w-full rounded-lg border border-black/10 px-2 text-[12px]"
-          />
-          {creating === 'blank' && (
-            <>
-              <input
-                value={draft.description}
-                onChange={(e) => setDraft({ ...draft, description: e.target.value })}
-                placeholder="描述"
-                className="h-9 w-full rounded-lg border border-black/10 px-2 text-[12px]"
-              />
-              <textarea
-                value={draft.instructions}
-                onChange={(e) => setDraft({ ...draft, instructions: e.target.value })}
-                placeholder="指令内容"
-                className="h-24 w-full rounded-lg border border-black/10 p-2 text-[12px]"
-              />
-            </>
-          )}
-          <div className="flex gap-2">
-            <button onClick={() => setCreating(null)} className="h-8 flex-1 rounded-lg border border-black/10 text-[12px] font-bold">
-              取消
-            </button>
-            <button
-              onClick={() => void (creating === 'blank' ? createBlank() : createFromChat())}
-              className="h-8 flex-1 rounded-lg bg-[#111] text-[12px] font-bold text-white"
-            >
-              保存
-            </button>
-          </div>
-        </div>
-      )}
-      {skills.map((s) => (
-        <div key={s.id} className="rounded-[18px] border border-black/6 p-2.5">
-          <p className="text-[13px] font-bold text-[#111]">{s.name}</p>
-          <p className="mt-0.5 line-clamp-2 text-[12px] text-[#777]">{s.description ?? s.instructions}</p>
-          {sessionId && (
-            <button
-              onClick={() => {
-                void api(`/skills/${s.id}/attach?sessionId=${sessionId}`, { method: 'POST' }).catch(() => undefined)
-                toastSuccess(`已添加 Skill：${s.name}`)
-              }}
-              className="mt-1.5 flex items-center gap-1 rounded-full bg-[#111] px-2.5 py-1 text-[11px] font-bold text-white"
-            >
-              添加到对话
-            </button>
-          )}
         </div>
       ))}
     </div>

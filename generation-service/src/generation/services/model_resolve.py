@@ -8,6 +8,13 @@ from ..core.config import settings
 from ..models import ModelConfig
 
 MODALITY_ALIASES = frozenset({"text", "image", "video", "audio", "compose", "director"})
+TEXT_MODEL_ALIASES = {
+    "deepseek-v4-pro": "agnes-2.5-flash",
+    "deepseek-v4-flash": "agnes-2.5-flash",
+    "deepseek-chat": "agnes-2.5-flash",
+    "qwen-max": "agnes-2.5-flash",
+    "gpt-4o-mini": "agnes-2.5-flash",
+}
 _MOCK_PROVIDERS = frozenset({
     "mock", "mock-text", "mock-image", "mock-video", "mock-audio", "mock-compose", "mock-director",
 })
@@ -15,10 +22,10 @@ _MOCK_PROVIDERS = frozenset({
 
 def _preferred_name(modality: str) -> str | None:
     mapping = {
-        "text": (settings.llm_model or "deepseek-v4-pro").strip() or "deepseek-v4-pro",
-        "image": (settings.ark_image_model or "doubao-seedream-5-0-260128").strip(),
-        "video": (settings.ark_video_model or "doubao-seedance-1-0-pro-250528").strip(),
-        "audio": "audio-1.0",
+        "text": (settings.llm_model or "agnes-2.5-flash").strip() or "agnes-2.5-flash",
+        "image": (settings.agnes_image_model or "agnes-image-2.1-flash").strip(),
+        "video": (settings.agnes_video_model or "agnes-video-v2.0").strip(),
+        "audio": "doubao-tts",
         "compose": "compose-1.0",
         "director": "director-1.0",
     }
@@ -30,6 +37,7 @@ def resolve_model_config(db: Session, model_type: str) -> ModelConfig | None:
     name = (model_type or "").strip()
     if not name:
         return None
+    name = TEXT_MODEL_ALIASES.get(name.lower(), name)
 
     exact = db.query(ModelConfig).filter(ModelConfig.name == name).first()
     if exact:

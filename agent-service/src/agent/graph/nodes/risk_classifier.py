@@ -21,7 +21,7 @@ def risk_classifier_node(state: AgentState) -> dict:
     pending_high: list[PlannedActionDict] = []
     executable: list[PlannedActionDict] = []
     contract_violations: list[dict] = []
-    events = list(state.get("events") or [])
+    events: list[dict] = []
 
     for action in state.get("planned_actions") or []:
         err = validate_action(action, canvas)

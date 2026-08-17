@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
-from ..agent.planner import PlannedAction, PlanResult
 
 # 创意术语：对用户话术应出现；内部 id / 工具名不应出现
 CREATIVE_TERMS = ("分镜", "镜头", "首帧", "脚本", "成片", "运镜", "节奏", "关键帧", "节点")
@@ -52,26 +51,30 @@ class MethodologyReport:
         }
 
 
-def _actions_of(plan: PlanResult | Iterable[PlannedAction] | list[dict]) -> list[Any]:
-    if isinstance(plan, PlanResult):
+def _is_action_obj(a: Any) -> bool:
+    return hasattr(a, "tool_name") and hasattr(a, "params")
+
+
+def _actions_of(plan: Any) -> list[Any]:
+    if hasattr(plan, "actions"):
         return list(plan.actions or [])
     return list(plan or [])
 
 
 def _tool(a: Any) -> str:
-    if isinstance(a, PlannedAction):
+    if _is_action_obj(a):
         return a.tool_name
     return str(a.get("tool_name") or a.get("tool") or "")
 
 
 def _params(a: Any) -> dict:
-    if isinstance(a, PlannedAction):
+    if _is_action_obj(a):
         return dict(a.params or {})
     return dict(a.get("params") or {})
 
 
 def _summary(a: Any) -> str:
-    if isinstance(a, PlannedAction):
+    if _is_action_obj(a):
         return a.summary or ""
     return str(a.get("summary") or "")
 
@@ -281,7 +284,7 @@ def audit_orchestration_actions(
         detail6 = "回复把 queued/提交说成已完成成品"
     findings.append(PrincipleFinding(6, "异步不编造按状态行动", async_ok, detail6))
 
-    # 七、三条纪律：缺了才查 / 有主见用语 / 不暴露内部 id
+    # 七、交互纪律：缺了才查 / 创作用语 / 不暴露内部 id
     read_tools = [t for t in tools if t.startswith(("get_", "list_", "search_"))]
     # 编排场景允许多 1 次 get_canvas_summary；禁止连环空读
     discipline_ok = True
@@ -296,12 +299,12 @@ def audit_orchestration_actions(
     if expect_multi_unit and reply and not any(term in reply for term in CREATIVE_TERMS):
         discipline_ok = False
         detail7 = "编排回复缺少创作术语（分镜/镜头/首帧等）"
-    findings.append(PrincipleFinding(7, "三条纪律", discipline_ok, detail7))
+    findings.append(PrincipleFinding(7, "交互三层纪律", discipline_ok, detail7))
 
     return MethodologyReport(findings=findings)
 
 
-def audit_plan_result(result: PlanResult, user_content: str = "", *, expect_multi_unit: bool = False) -> MethodologyReport:
+def audit_plan_result(result: Any, user_content: str = "", *, expect_multi_unit: bool = False) -> MethodologyReport:
     return audit_orchestration_actions(
         result.actions,
         reply=result.reply or "",
@@ -311,7 +314,7 @@ def audit_plan_result(result: PlanResult, user_content: str = "", *, expect_mult
     )
 
 
-def assert_methodology(result: PlanResult, user_content: str = "", *, expect_multi_unit: bool = False) -> None:
+def assert_methodology(result: Any, user_content: str = "", *, expect_multi_unit: bool = False) -> None:
     report = audit_plan_result(result, user_content, expect_multi_unit=expect_multi_unit)
     if not report.ok:
         failed = "; ".join(f"P{f.principle} {f.name}: {f.detail}" for f in report.failed())

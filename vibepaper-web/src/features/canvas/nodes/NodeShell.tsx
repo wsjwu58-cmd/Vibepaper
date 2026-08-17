@@ -83,11 +83,8 @@ export function NodeShell({
   const isEditing = editingNodeId === sid(node.id)
   const typeModels = models.filter((m) => m.modelType === node.type)
   const preferred =
-    typeModels.find((m) => /seedream-5-0(?!-pro)|seedance-1-0-pro/i.test(m.name)) ??
-    typeModels.find((m) => /seedream|seedance/i.test(m.name)) ??
-    typeModels.find((m) => m.name === 'deepseek-v4-pro') ??
-    typeModels.find((m) => m.name === 'deepseek-v4-flash') ??
-    typeModels.find((m) => m.name === 'deepseek-chat') ??
+    typeModels.find((m) => /agnes-image|agnes-video|agnes-2\.5/i.test(m.name)) ??
+    typeModels.find((m) => /agnes|seedream|seedance|doubao-tts/i.test(m.name)) ??
     typeModels[0]
   const selectedModel =
     typeModels.find((m) => m.name === (node.params.model as string)) || preferred

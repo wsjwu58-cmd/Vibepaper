@@ -14,10 +14,10 @@ MODEL_WAIT = {
 
 
 def clock_node(state: AgentState) -> dict:
-    events = list(state.get("events") or [])
+    events: list[dict] = []
     clock_fn = TOOLS.get("clock")
     if not clock_fn:
-        return {"events": events}
+        return {}
 
     for result in state.get("executed_results") or []:
         if not (result.get("ack") and result.get("task_id")):

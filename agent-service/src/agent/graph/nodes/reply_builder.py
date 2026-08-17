@@ -40,10 +40,23 @@ def _dedupe_steps(steps: list[dict]) -> list[dict]:
 
 
 def _collect_execution_steps(state: AgentState) -> list[dict]:
+    """收集执行记录步骤：整体 thinking → 推理过程；plan/result → 操作步骤。"""
     steps: list[dict] = []
     idx = 0
     for ev in state.get("events") or []:
-        if ev.get("type") == "plan_step":
+        ev_type = ev.get("type")
+        if ev_type in ("thinking", "reflection"):
+            content = str(ev.get("content") or ev.get("note") or "").strip()
+            if not content:
+                continue
+            steps.append({
+                "id": f"reason-{idx}",
+                "kind": "reasoning",
+                "label": "推理过程",
+                "summary": content[:2000],
+            })
+            idx += 1
+        elif ev_type == "plan_step":
             tool = ev.get("tool")
             steps.append({
                 "id": f"plan-{idx}",
@@ -54,7 +67,7 @@ def _collect_execution_steps(state: AgentState) -> list[dict]:
                 "reasoning": str(ev.get("reasoning") or "")[:400],
             })
             idx += 1
-        elif ev.get("type") == "action_result":
+        elif ev_type == "action_result":
             tool = ev.get("tool")
             ok = bool(ev.get("ok"))
             data = ev.get("data") or {}
@@ -71,32 +84,12 @@ def _collect_execution_steps(state: AgentState) -> list[dict]:
                 "detail": detail,
             })
             idx += 1
-        # thinking / reflection 不单独成「推理过程」块（图二）；
-        # 理由落在 plan_step.reasoning → 前端「为什么这么做」（图一）
     return _dedupe_steps(steps)
 
 
 def _infer_next_actions_from_results(state: AgentState) -> list[str]:
-    existing = list(state.get("next_actions") or [])
-    if existing:
-        return existing[:5]
-    hints: list[str] = []
-    for r in state.get("executed_results") or []:
-        if r.get("ack"):
-            mt = r.get("model_type") or ""
-            if mt == "image":
-                hints = ["图生视频", "换风格重做", "微调 Prompt 再生成"]
-            elif mt == "video":
-                hints = ["换运镜重做", "抽帧 / 裁剪", "接续剧情"]
-            elif mt == "text":
-                hints = ["生成配图", "延展三个方向", "改写文案"]
-        elif r.get("ok") and r.get("tool") == "create_nodes":
-            hints = hints or ["提交生成", "调整节点布局"]
-    stage = state.get("pipeline_stage") or ""
-    if not hints and stage in ("visual_anchor", "dynamic_gen"):
-        hints = ["图生视频", "添加配音", "整理画布"]
-    return hints[:5] or ["梳理画布", "给我三个方向"]
-
+    """只透传规划阶段给出的 next_actions；不再按模型类型/阶段硬编码词表。"""
+    return list(state.get("next_actions") or [])[:5]
 
 def _build_reply_from_results(state: AgentState) -> str:
     results = state.get("executed_results") or []
@@ -104,24 +97,33 @@ def _build_reply_from_results(state: AgentState) -> str:
     lines: list[str] = []
 
     preset = (state.get("reply") or "").strip()
+    from ...domain.turn_policy import is_process_narration, silence_process_reply
+
+    if preset and is_process_narration(preset) and not state.get("needs_user_input"):
+        preset = ""
     # task_status 的成功/失败文案也是正式回复，不能丢
     if preset:
         lines.append(preset)
 
-    submitted = [r for r in results if r.get("ack") and r.get("task_id")]
+    submitted = [
+        r for r in results
+        if r.get("ack") and r.get("task_id") and r.get("tool") == "submit_generation"
+    ]
     created = [r for r in results if r.get("ok") and r.get("tool") == "create_nodes"]
-    failed = [r for r in results if not r.get("ok")]
+    failed = [r for r in results if not r.get("ok") and r.get("tool") != "check_task_status"]
 
     if created and not preset:
         count = sum(len((r.get("data") or {}).get("createdNodes") or []) or 1 for r in created)
         lines.append(f"✅ 已在画布创建 {count} 个节点并建立连线")
 
-    for r in submitted:
-        mt = r.get("model_type") or "生成"
-        lines.append(
-            f"⏳ {mt} 任务已提交，后台生成中；"
-            f"依赖就绪的下游节点会自动开始，完成后我来通知你"
-        )
+    # 提交中的话术不进对话气泡（会在每次 clock 唤醒时刷屏）。
+    # 唤醒完成文案在 preset；workflow_notes 只在首次创建节点时带一条。
+    if created and not preset:
+        for r in submitted:
+            for note in (r.get("workflow_notes") or (r.get("data") or {}).get("workflow_notes") or []):
+                if note:
+                    lines.append(f"· {note}")
+                    break
 
     for r in failed:
         err = (r.get("data") or {}).get("error", "未知错误")
@@ -143,7 +145,16 @@ def _build_reply_from_results(state: AgentState) -> str:
             lines.append("⏸ 有操作待你确认后才会改画布或扣费")
 
     if not lines:
-        lines.append("已理解指令。可以继续描述创作目标，或让我梳理画布 / 写文案 / 延展方向。")
+        if state.get("needs_user_input"):
+            lines.append(silence_process_reply(state.get("reply") or "", keep_if_genuine_ask=True) or "还缺一条关键信息才能继续。")
+        elif created or submitted:
+            pass
+        elif (state.get("reply_type") or "") in ("directions", "summary", "copy") and (state.get("reply") or "").strip():
+            # 讨论/建议态：preset 已被 is_process_narration 误杀时，仍应用 state.reply
+            lines.append((state.get("reply") or "").strip())
+        else:
+            # 无结果且无提问：保持静默，避免「指令已理解」假完成
+            return ""
 
     return "\n".join(lines)
 
@@ -168,20 +179,24 @@ def reply_builder_node(state: AgentState) -> dict:
         )
         only_inflight = statuses and all(s in ("queued", "running", "") for s in statuses)
         if only_inflight and not has_terminal and not preset:
-            events = list(state.get("events") or [])
-            events.append({
-                "type": "task_status",
-                "silent": True,
-                "data": (state.get("executed_results") or [{}])[0].get("data") or {},
-            })
-            return {"reply": "", "events": events}
+            return {
+                "reply": "",
+                "events": [{
+                    "type": "task_status",
+                    "silent": True,
+                    "data": (state.get("executed_results") or [{}])[0].get("data") or {},
+                }],
+            }
 
     reply = _build_reply_from_results(state)
     # 下一步建议由前端 AgentNextActions 可点击渲染，不在正文重复拼一段文本
 
-    events = list(state.get("events") or [])
+    out: dict = {
+        "reply": reply,
+        "next_actions": next_actions,
+    }
     if reply.strip():
-        events.append({
+        out["events"] = [{
             "type": "assistant_message",
             "content": reply,
             "replyType": reply_type,
@@ -191,9 +206,5 @@ def reply_builder_node(state: AgentState) -> dict:
             "executionSteps": execution_steps,
             "staleNodes": (state.get("canvas_context") or {}).get("staleNodes") or [],
             "requiresConfirmation": bool(state.get("pending_confirm") or state.get("pending_high_risk")),
-        })
-    return {
-        "reply": reply,
-        "next_actions": next_actions,
-        "events": events,
-    }
+        }]
+    return out

@@ -28,6 +28,8 @@ export function ModelPicker({
   const rootRef = useRef<HTMLDivElement>(null)
   const current = models.find((m) => m.name === value)
   const iconSize = composer ? 20 : dark || compact ? 16 : 20
+  const visible = models.filter((m) => !/兼容别名|已停用/.test(String(m.description || '')))
+  const menuModels = visible.length ? visible : models
 
   useEffect(() => {
     if (!open) return
@@ -65,7 +67,7 @@ export function ModelPicker({
             dark || compact || composer ? 'bottom-full left-0 mb-1' : 'left-0 top-full mt-1 w-full'
           }`}
         >
-          {(models.length ? models : value ? [{ name: value, displayName: value } as ModelInfo] : []).map((m) => {
+          {(menuModels.length ? menuModels : value ? [{ name: value, displayName: value } as ModelInfo] : []).map((m) => {
             const selected = m.name === value
             return (
               <button

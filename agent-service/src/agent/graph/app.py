@@ -11,19 +11,35 @@ from langgraph.types import Command
 
 from ..core.config import settings
 from .nodes import (
+    acquire_context_node,
+    answer_discussion_node,
     check_task_status_node,
+    classify_intent_node,
     clock_node,
     confirmer_node,
     context_builder_node,
+    create_plan_node,
     executor_node,
+    fallback_node,
+    finalize_node,
+    ingest_node,
+    load_skill_node,
     memory_updater_node,
     parallel_merge_node,
-    planner_node,
+    plan_recovery_node,
+    reconcile_canvas_node,
     reflect_node,
     reply_builder_node,
+    request_user_input_node,
     risk_classifier_node,
-    skill_loader_node,
+    select_skill_node,
     tool_worker_node,
+    validate_plan_node,
+)
+from .nodes.orchestration_nodes import (
+    route_after_intent,
+    route_after_select_skill,
+    route_after_validate,
 )
 from .routing import (
     route_after_check_status,
@@ -77,10 +93,24 @@ def _build_checkpointer():
 
 
 def build_graph(checkpointer=None):
+    """意图分流 → 创意规划/执行编译 → 确认/执行 → 依赖链推进（clock）→ 收尾。"""
     g = StateGraph(AgentState)
+
+    g.add_node("ingest", ingest_node)
     g.add_node("context_builder", context_builder_node)
-    g.add_node("skill_loader", skill_loader_node)
-    g.add_node("planner", planner_node)
+    g.add_node("classify_intent", classify_intent_node)
+
+    g.add_node("answer_discussion", answer_discussion_node)
+    g.add_node("fallback", fallback_node)
+    g.add_node("acquire_context", acquire_context_node)
+    g.add_node("reconcile_canvas", reconcile_canvas_node)
+    g.add_node("plan_recovery", plan_recovery_node)
+    g.add_node("select_skill", select_skill_node)
+    g.add_node("load_skill", load_skill_node)
+    g.add_node("create_plan", create_plan_node)
+    g.add_node("validate_plan", validate_plan_node)
+    g.add_node("request_user_input", request_user_input_node)
+
     g.add_node("risk_classifier", risk_classifier_node)
     g.add_node("executor", executor_node)
     g.add_node("tool_worker", tool_worker_node)
@@ -88,40 +118,74 @@ def build_graph(checkpointer=None):
     g.add_node("reflect", reflect_node)
     g.add_node("confirmer", confirmer_node)
     g.add_node("clock_node", clock_node)
+
+    g.add_node("finalize", finalize_node)
     g.add_node("reply_builder", reply_builder_node)
     g.add_node("memory_updater", memory_updater_node)
 
-    g.add_edge(START, "context_builder")
-    g.add_edge("context_builder", "skill_loader")
-    g.add_edge("skill_loader", "planner")
-    g.add_edge("planner", "risk_classifier")
+    g.add_edge(START, "ingest")
+    g.add_edge("ingest", "context_builder")
+    g.add_edge("context_builder", "classify_intent")
+
+    g.add_conditional_edges("classify_intent", route_after_intent, {
+        "answer_discussion": "answer_discussion",
+        "acquire_context": "acquire_context",
+        "reconcile_canvas": "reconcile_canvas",
+        "plan_recovery": "plan_recovery",
+        "select_skill": "select_skill",
+        "fallback": "fallback",
+    })
+
+    g.add_edge("answer_discussion", "finalize")
+    g.add_edge("fallback", "finalize")
+    g.add_edge("acquire_context", "select_skill")
+    g.add_edge("reconcile_canvas", "create_plan")
+    g.add_edge("plan_recovery", "create_plan")
+
+    g.add_conditional_edges("select_skill", route_after_select_skill, {
+        "load_skill": "load_skill",
+        "create_plan": "create_plan",
+    })
+    g.add_edge("load_skill", "create_plan")
+    g.add_edge("create_plan", "validate_plan")
+
+    g.add_conditional_edges("validate_plan", route_after_validate, {
+        "ask_user": "request_user_input",
+        "execute": "risk_classifier",
+        "finalize": "finalize",
+    })
+    g.add_edge("request_user_input", "finalize")
+
     g.add_conditional_edges("risk_classifier", route_by_risk, {
         "execute": "executor",
         "confirm": "confirmer",
-        "done": "reply_builder",
+        "done": "finalize",
     })
     g.add_conditional_edges("confirmer", route_by_confirm, {
         "accept": "executor",
-        "reject": "reply_builder",
+        "reject": "finalize",
     })
     g.add_conditional_edges("executor", route_after_exec, {
         "confirm": "confirmer",
         "wait_for_result": "clock_node",
         "reflect": "reflect",
-        "done": "reply_builder",
+        "continue": "create_plan",
+        "done": "finalize",
     })
     g.add_edge("tool_worker", "parallel_merge")
     g.add_conditional_edges("parallel_merge", route_after_exec, {
         "confirm": "confirmer",
         "wait_for_result": "clock_node",
         "reflect": "reflect",
-        "done": "reply_builder",
+        "continue": "create_plan",
+        "done": "finalize",
     })
     g.add_conditional_edges("reflect", route_after_reflect, {
-        "replan": "planner",
-        "reply": "reply_builder",
+        "replan": "create_plan",
+        "reply": "finalize",
     })
-    g.add_edge("clock_node", "reply_builder")
+    g.add_edge("clock_node", "finalize")
+    g.add_edge("finalize", "reply_builder")
     g.add_edge("reply_builder", "memory_updater")
     g.add_edge("memory_updater", END)
     return g.compile(checkpointer=checkpointer)
@@ -348,21 +412,70 @@ def _events_from_graph_result(result: Any, initial: list[dict] | None = None) ->
 
 
 def try_resume_dialog_confirm(session_id: int, user_id: int, accept: bool) -> list[dict] | None:
-    """用户于对话中回复「确认/取消」时续跑 LangGraph。"""
+    """用户于对话中回复「确认/取消」时续跑 LangGraph（HITL 恢复，不重跑整图）。"""
+    graph = get_agent_graph()
+    config = _config(session_id)
+
+    # 必须有挂起的 confirmer，否则交给正常 turn（避免「确认」被当新指令）
+    has_interrupt = False
+    event_watermark = 0
+    try:
+        snap = graph.get_state(config)
+        if snap and snap.next and "confirmer" in (snap.next or ()):
+            has_interrupt = True
+        if snap and isinstance(getattr(snap, "values", None), dict):
+            event_watermark = len(snap.values.get("events") or [])
+    except Exception:
+        pass
+
     action_id = find_pending_confirm_action_id(session_id)
-    if not action_id:
+    if not action_id and not has_interrupt:
         return None
-    result = resume_agent_confirm(session_id, user_id, action_id, accept)
-    if not result.get("ok"):
+
+    result = resume_agent_confirm(
+        session_id, user_id, int(action_id or 0), accept,
+    )
+
+    if not result or not result.get("ok"):
         return [
-            {"type": "assistant_message", "content": result.get("error") or "确认失败"},
+            {"type": "assistant_message", "content": (result or {}).get("error") or "确认失败"},
+            {"type": "done"},
+        ]
+    if result.get("cancelled"):
+        return [
+            {"type": "assistant_message", "content": "已取消操作。"},
             {"type": "done"},
         ]
     inner = (result.get("result") or {})
     graph_result = inner if isinstance(inner, dict) and inner.get("events") is not None else result
-    events = _events_from_graph_result(graph_result if isinstance(graph_result, dict) else {})
+    all_events = list((graph_result or {}).get("events") or []) if isinstance(graph_result, dict) else []
+    # 只回传 interrupt 之后的增量，避免前端把规划过程重放一遍
+    delta = all_events[event_watermark:] if event_watermark and len(all_events) >= event_watermark else all_events
+    keep_types = {
+        "inline_confirm", "action_result", "assistant_message", "confirm_required",
+        "usage", "done", "task_status", "clock_scheduled", "contract_blocked",
+    }
+    events: list[dict] = []
+    for e in delta:
+        if not isinstance(e, dict):
+            continue
+        if e.get("__replace_events__") or e.get("__replace_results__"):
+            continue
+        if e.get("type") in keep_types:
+            # 收尾消息去掉历史 executionSteps，只留本拍结果
+            if e.get("type") == "assistant_message" and e.get("executionSteps"):
+                steps = [
+                    s for s in (e.get("executionSteps") or [])
+                    if isinstance(s, dict) and s.get("kind") in ("result", "speech")
+                ]
+                e = {**e, "executionSteps": steps}
+            events.append(e)
+
     if not any(e.get("type") == "assistant_message" for e in events):
-        msg = "已确认并继续执行。" if accept else "已取消操作。"
+        reply = ""
+        if isinstance(graph_result, dict):
+            reply = str(graph_result.get("reply") or "").strip()
+        msg = reply or ("已确认并继续执行。" if accept else "已取消操作。")
         events.append({"type": "assistant_message", "content": msg})
     if not any(e.get("type") == "done" for e in events):
         events.append({"type": "done"})
@@ -377,7 +490,40 @@ def run_agent_turn(
     selected_nodes: list[int] | None,
 ) -> list[dict]:
     """执行一轮对话，返回 SSE 事件列表。"""
+    from .confirm_helpers import parse_confirm_intent
+    from .state import reset_events, reset_executed_results
+
+    # HITL：纯确认/取消文本优先恢复 interrupt，绝不整图重跑
+    confirm_intent = parse_confirm_intent(content)
+    if confirm_intent:
+        resumed = try_resume_dialog_confirm(
+            session_id, user_id, accept=(confirm_intent == "accept"),
+        )
+        if resumed is not None:
+            return resumed
+        # 无挂起确认：提示用户，避免把「确认」当新创作指令
+        return [
+            {
+                "type": "assistant_message",
+                "content": "当前没有待确认的操作。请重新描述你想做的事，或点选下一步建议。",
+            },
+            {"type": "done"},
+        ]
+
     graph = get_agent_graph()
+    config = _config(session_id)
+
+    # 若上一轮卡在 confirmer interrupt，而本轮不是「确认/取消」文本，
+    # 先取消中断，否则同 thread 再 invoke 会与挂起态冲突。
+    try:
+        snap = graph.get_state(config)
+        if snap and snap.next and "confirmer" in (snap.next or ()):
+            aid = find_pending_confirm_action_id(session_id)
+            if aid:
+                resume_agent_confirm(session_id, user_id, aid, accept=False)
+    except Exception:
+        logger.warning("clear stale confirmer interrupt failed session=%s", session_id, exc_info=True)
+
     initial: AgentState = {
         "session_id": session_id,
         "user_id": user_id,
@@ -393,10 +539,30 @@ def run_agent_turn(
         "recent_messages": [],
         "project_memories": [],
         "long_term_prefs": [],
+        "react_mode": False,
+        "react_step": 0,
+        "max_react_steps": 8,
+        "react_decision": "act",
+        "observations": [],
+        "run_version": 0,
+        "cancelled_run_versions": [],
+        "intent": {},
+        "selected_skill_keys": [],
+        "plan": {},
+        "pending_runs": [],
+        "current_step_id": None,
+        "tool_result": None,
+        "needs_user_input": False,
+        "waiting_external_event": False,
+        "terminal_status": "running",
+        "validation_route": "",
+        "confirmed_action": None,
+        "generation_preferences": {},
         "planned_actions": [],
         "pending_high_risk": [],
         "executable_actions": [],
-        "executed_results": [],
+        # 关键：丢掉 checkpoint 里可能膨胀到数百 MB 的历史列表
+        "executed_results": reset_executed_results(),
         "confirm_accept": None,
         "pending_confirm": None,
         "reply_type": "general",
@@ -404,20 +570,19 @@ def run_agent_turn(
         "suggestions": [],
         "next_actions": [],
         "reply": "",
-        "events": [{"type": "user_message", "content": content}],
+        "events": reset_events({"type": "user_message", "content": content}),
         "context_token_estimate": 0,
         "telemetry": [],
         "reflection_count": 0,
         "needs_reflection": False,
         "reflection_note": "",
-        "contract_violations": [],
+        "contract_violations": [{"__replace_violations__": True}],
         "current_action": {},
         "wakeup_note": {},
         "needs_reclock": False,
     }
 
-    config = _config(session_id)
-    events: list[dict] = list(initial["events"])
+    events: list[dict] = [{"type": "user_message", "content": content}]
 
     try:
         result = graph.invoke(initial, config=config)
@@ -456,6 +621,8 @@ def run_agent_turn(
         state_events = result.get("events") or []
         seen_types_ids = set()
         for e in state_events:
+            if not isinstance(e, dict) or e.get("__replace_events__") or e.get("__replace_results__"):
+                continue
             key = (e.get("type"), e.get("actionId"), e.get("tool"), e.get("content"))
             if key not in seen_types_ids:
                 events.append(e)
@@ -511,6 +678,7 @@ def resume_agent_confirm(
     action_id: int,
     accept: bool,
     expected_canvas_version: int | None = None,
+    confirmed_action: dict | None = None,
 ) -> dict:
     """从 checkpoint resume 确认。"""
     from ..core.db import SessionLocal
@@ -522,6 +690,20 @@ def resume_agent_confirm(
     graph = get_agent_graph()
     config = _config(session_id)
 
+    # action_id<=0：仅恢复 interrupt，不依赖 DB 行（HITL 兜底）
+    if int(action_id or 0) <= 0:
+        try:
+            snap = graph.get_state(config)
+            if not (snap and snap.next and "confirmer" in (snap.next or ())):
+                return {"ok": False, "error": "没有待确认的操作"}
+            result = graph.invoke(
+                Command(resume={"accept": bool(accept), "actionId": 0}),
+                config=config,
+            )
+            return {"ok": True, "result": result if isinstance(result, dict) else {}}
+        except Exception as exc:
+            return {"ok": False, "error": f"确认恢复失败：{str(exc)[:120]}"}
+
     db = SessionLocal()
     try:
         session = db.get(AgentSession, session_id)
@@ -529,6 +711,17 @@ def resume_agent_confirm(
             return {"ok": False, "error": "会话不存在"}
         record = db.get(AgentAction, action_id)
         if not record or record.session_id != session_id:
+            # DB 丢失时仍尝试 checkpoint resume
+            try:
+                snap = graph.get_state(config)
+                if snap and snap.next and "confirmer" in (snap.next or ()):
+                    result = graph.invoke(
+                        Command(resume={"accept": bool(accept), "actionId": action_id}),
+                        config=config,
+                    )
+                    return {"ok": True, "result": result if isinstance(result, dict) else {}}
+            except Exception:
+                pass
             return {"ok": False, "error": "确认记录不存在"}
 
         # checkpoint TTL：中断超过 5 分钟则确认失效
@@ -578,8 +771,18 @@ def resume_agent_confirm(
                 pass
             return {"ok": True, "cancelled": True}
 
+        # 确认卡手改配置：写入动作参数并随 resume 下发
+        if confirmed_action and isinstance(confirmed_action, dict):
+            from ..domain.precedence import apply_confirmed_action
+            merged = apply_confirmed_action(record.params or {}, confirmed_action)
+            record.params = merged
+            db.commit()
+
         agent_confirm_accept(session_id, record.tool_name or "")
-        result = graph.invoke(Command(resume={"accept": True, "actionId": action_id}), config=config)
+        resume_payload: dict = {"accept": True, "actionId": action_id}
+        if confirmed_action and isinstance(confirmed_action, dict):
+            resume_payload["confirmedAction"] = confirmed_action
+        result = graph.invoke(Command(resume=resume_payload), config=config)
         record.status = "executed"
         db.commit()
         return {"ok": True, "result": result if isinstance(result, dict) else {}}

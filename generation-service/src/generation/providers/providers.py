@@ -157,20 +157,85 @@ def first_reference_image(params: dict) -> str | None:
     return None
 
 
-VIDEO_MODEL_ALIASES: dict[str, str] = {
-    "seedance-1.0": "doubao-seedance-1-0-pro-250528",
-    "wan-2.1": "doubao-seedance-1-0-pro-250528",
-    "doubao-seedance-1-5-pro-251215": "doubao-seedance-1-0-pro-250528",
+# 旧方舟 / Mock 别名 → Agnes 正式模型名
+IMAGE_MODEL_ALIASES: dict[str, str] = {
+    "seedream-4": "agnes-image-2.1-flash",
+    "flux-dev": "agnes-image-2.1-flash",
+    "sd3-medium": "agnes-image-2.1-flash",
+    "doubao-seedream-5-0-260128": "agnes-image-2.1-flash",
+    "doubao-seedream-4-0-250828": "agnes-image-2.1-flash",
+    "doubao-seedream-4-5-251128": "agnes-image-2.1-flash",
 }
+
+VIDEO_MODEL_ALIASES: dict[str, str] = {
+    "seedance-1.0": "agnes-video-v2.0",
+    "seedance-1.5": "agnes-video-v2.0",
+    "wan-2.1": "agnes-video-v2.0",
+    "kling-2.0": "agnes-video-v2.0",
+    "doubao-seedance-1-5-pro-251215": "agnes-video-v2.0",
+    "doubao-seedance-1-0-pro-250528": "agnes-video-v2.0",
+    "doubao-seedance-2-0-mini-260615": "agnes-video-v2.0",
+    "doubao-seedance-2-0-260128": "agnes-video-v2.0",
+}
+
+
+def resolve_image_model(model_name: str | None) -> str:
+    raw = (model_name or "").strip()
+    if raw in IMAGE_MODEL_ALIASES:
+        return IMAGE_MODEL_ALIASES[raw]
+    if raw.startswith("agnes-image"):
+        return raw
+    return raw or settings.agnes_image_model or "agnes-image-2.1-flash"
 
 
 def resolve_video_model(model_name: str | None) -> str:
     raw = (model_name or "").strip()
     if raw in VIDEO_MODEL_ALIASES:
         return VIDEO_MODEL_ALIASES[raw]
-    if raw.startswith("doubao-seedance"):
+    if raw.startswith("agnes-video"):
         return raw
-    return raw or settings.ark_video_model or "doubao-seedance-1-0-pro-250528"
+    return raw or settings.agnes_video_model or "agnes-video-v2.0"
+
+
+def _agnes_frames_for_duration(seconds: int, fps: int = 24) -> int:
+    """Agnes Video：num_frames ≤ 441 且满足 8n+1。"""
+    target = max(1, int(seconds) * int(fps))
+    n = max(1, round((target - 1) / 8))
+    return min(441, 8 * n + 1)
+
+
+def _httpx_retry_429(request_fn, *, attempts: int = 4, first_delay: float = 2.0):
+    """Agnes 创建接口遇 429 时退避重试，避免立刻失败。"""
+    import time
+
+    delay = first_delay
+    last = None
+    for _ in range(max(1, attempts)):
+        last = request_fn()
+        if getattr(last, "status_code", 0) != 429:
+            return last
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+    return last
+
+
+def _agnes_wh_from_params(params: dict) -> tuple[int, int]:
+    ratio = str(params.get("ratio") or "").strip()
+    resolution = str(params.get("resolution") or "").strip().lower()
+    if "x" in resolution:
+        try:
+            w, h = (int(x) for x in resolution.split("x", 1))
+            return max(64, w), max(64, h)
+        except Exception:
+            pass
+    mapping = {
+        "16:9": (1152, 768),
+        "9:16": (768, 1152),
+        "1:1": (768, 768),
+        "4:3": (1024, 768),
+        "3:4": (768, 1024),
+    }
+    return mapping.get(ratio, (1152, 768))
 
 
 def parse_ark_http_error(response) -> tuple[str, str]:
@@ -189,6 +254,11 @@ def parse_ark_http_error(response) -> tuple[str, str]:
     if code in {"InvalidEndpointOrModel.NotFound", "NotFound"}:
         return "MODEL_UNAVAILABLE", (
             f"视频模型不可用（{message}）。请确认模型 ID 正确，且当前账号已开通该模型。"
+        )
+    if "AccountOverdue" in code or "overdue" in message.lower() or "欠费" in message:
+        return "INSUFFICIENT_POINTS", (
+            f"方舟账号欠费或该模型无可用额度（{message[:200]}）。"
+            "请确认调用的是已开通且有免费额度的模型（如 Seedance 1.5 Pro），并在控制台结清欠费。"
         )
     if message:
         return code if code else "MODEL_UNAVAILABLE", message[:500]
@@ -210,13 +280,32 @@ class MockTextProvider(ModelProvider):
         return ProviderJob(job_id=f"txt-{request.task_id}", status="succeeded", result={"outputs": results})
 
 
+_TEXT_MODEL_ALIASES = {
+    "deepseek-v4-pro": "agnes-2.5-flash",
+    "deepseek-v4-flash": "agnes-2.5-flash",
+    "deepseek-chat": "agnes-2.5-flash",
+    "qwen-max": "agnes-2.5-flash",
+    "gpt-4o-mini": "agnes-2.5-flash",
+}
+
+
 class OpenAICompatibleTextProvider(ModelProvider):
-    """OpenAI 兼容文本生成（DeepSeek / Qwen / OpenAI）。"""
+    """OpenAI 兼容文本生成（Agnes Chat Completions）。"""
 
     name = "openai-text"
 
     def generate(self, request: GenerationRequest) -> ProviderJob:
-        api_key = settings.llm_api_key or os.getenv("VIBEPAPER_LLM_API_KEY", "")
+        model = request.model_name or settings.llm_model or "agnes-2.5-flash"
+        model = _TEXT_MODEL_ALIASES.get(str(model).strip().lower(), model)
+        using_agnes = "agnes" in str(model).lower() or "agnes-ai.com" in (
+            settings.agnes_base_url or settings.llm_base_url or ""
+        )
+        if using_agnes:
+            api_key = settings.agnes_api_key or settings.llm_api_key or os.getenv("VIBEPAPER_AGNES_API_KEY", "") or os.getenv("VIBEPAPER_LLM_API_KEY", "")
+            base = (settings.agnes_base_url or settings.llm_base_url or "https://apihub.agnes-ai.com/v1").rstrip("/")
+        else:
+            api_key = settings.llm_api_key or os.getenv("VIBEPAPER_LLM_API_KEY", "")
+            base = (settings.llm_base_url or "https://apihub.agnes-ai.com/v1").rstrip("/")
         if not api_key:
             # 本地无 Key 才允许 mock；有 Key 时失败必须暴露，禁止静默假成功
             return MockTextProvider().generate(request)
@@ -224,9 +313,7 @@ class OpenAICompatibleTextProvider(ModelProvider):
             import httpx
 
             user_content = build_text_user_content(request.params)
-            model = request.model_name or settings.llm_model
-            base = (settings.llm_base_url or "https://api.deepseek.com/v1").rstrip("/")
-            if "deepseek.com" in base and not base.endswith("/v1"):
+            if ("agnes-ai.com" in base or "deepseek.com" in base) and not base.endswith("/v1"):
                 base = f"{base}/v1"
             resp = httpx.post(
                 f"{base}/chat/completions",
@@ -615,30 +702,118 @@ class MockAudioProvider(ModelProvider):
     name = "mock-audio"
 
     def generate(self, request: GenerationRequest) -> ProviderJob:
-        count = int(request.params.get("count", 1))
-        outputs = []
-        for i in range(count):
-            out_path = Path(request.output_dir) / f"output_{i}.wav"
+        return ProviderJob(
+            job_id=f"aud-disabled-{request.task_id}",
+            status="failed",
+            error_code="MODEL_UNAVAILABLE",
+            error_message="本地 Mock 音频已停用，请改用「豆包语音合成」（doubao-tts）",
+        )
+
+
+class DoubaoTtsProvider(ModelProvider):
+    """火山语音豆包 TTS（OpenSpeech）。需配置 VIBEPAPER_SPEECH_APP_ID / TOKEN。"""
+
+    name = "doubao-tts"
+
+    def generate(self, request: GenerationRequest) -> ProviderJob:
+        import base64
+        import uuid
+
+        import httpx
+
+        app_id = (getattr(settings, "speech_app_id", None) or "").strip()
+        token = (getattr(settings, "speech_token", None) or "").strip()
+        cluster = (getattr(settings, "speech_cluster", None) or "volcano_tts").strip()
+        if not app_id or not token:
+            return ProviderJob(
+                job_id=f"tts-no-cred-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message=(
+                    "未配置火山语音凭证（VIBEPAPER_SPEECH_APP_ID / VIBEPAPER_SPEECH_TOKEN）。"
+                    "请在火山引擎「语音技术」控制台创建应用后填入 .env。"
+                ),
+            )
+
+        text = build_generation_prompt(request.params) or str(request.params.get("text") or "").strip()
+        if not text:
+            return ProviderJob(
+                job_id=f"tts-empty-{request.task_id}",
+                status="failed",
+                error_code="INVALID_INPUT",
+                error_message="语音合成需要文本 prompt",
+            )
+
+        voice = str(
+            request.params.get("voice")
+            or request.params.get("voice_type")
+            or "zh_female_tianmeixiaoyuan_moon_bigtts"
+        )
+        speed = float(request.params.get("speed") or 1.0)
+        payload = {
+            "app": {"appid": app_id, "token": token, "cluster": cluster},
+            "user": {"uid": str(request.params.get("user_id") or "vibepaper")},
+            "audio": {
+                "voice_type": voice,
+                "encoding": "mp3",
+                "speed_ratio": max(0.5, min(speed, 2.0)),
+            },
+            "request": {
+                "reqid": str(uuid.uuid4()),
+                "text": text[:1024],
+                "operation": "query",
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer;{token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(
+                    "https://openspeech.bytedance.com/api/v1/tts",
+                    headers=headers,
+                    json=payload,
+                )
+            data = resp.json() if resp.content else {}
+            if resp.status_code >= 400 or int(data.get("code") or 0) not in {0, 3000}:
+                msg = str(data.get("message") or data.get("msg") or resp.text or f"HTTP {resp.status_code}")
+                return ProviderJob(
+                    job_id=f"tts-err-{request.task_id}",
+                    status="failed",
+                    error_code="MODEL_UNAVAILABLE",
+                    error_message=f"豆包语音合成失败：{msg[:400]}",
+                )
+            b64 = data.get("data")
+            if not b64:
+                return ProviderJob(
+                    job_id=f"tts-empty-data-{request.task_id}",
+                    status="failed",
+                    error_code="MODEL_UNAVAILABLE",
+                    error_message="豆包语音合成未返回音频数据",
+                )
+            out_path = Path(request.output_dir) / "tts.mp3"
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            sample_rate = 44100
-            duration = 3
-            freq = 220 + i * 80
-            with wave.open(str(out_path), "w") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                frames = bytearray()
-                for n in range(sample_rate * duration):
-                    value = int(12000 * math.sin(2 * math.pi * freq * n / sample_rate) * (1 - n / (sample_rate * duration)))
-                    frames += value.to_bytes(2, "little", signed=True)
-                wf.writeframes(bytes(frames))
-            outputs.append({
-                "url": f"/api/v1/tasks/{request.task_id}/outputs/file/{out_path.name}",
-                "file_path": str(out_path),
-                "content_type": "audio/wav",
-                "meta": {"index": i, "outputType": "audio"},
-            })
-        return ProviderJob(job_id=f"aud-{request.task_id}", status="succeeded", result={"outputs": outputs})
+            out_path.write_bytes(base64.b64decode(b64))
+            return ProviderJob(
+                job_id=f"tts-{request.task_id}",
+                status="succeeded",
+                result={
+                    "outputs": [{
+                        "url": f"/api/v1/tasks/{request.task_id}/outputs/file/{out_path.name}",
+                        "file_path": str(out_path),
+                        "content_type": "audio/mpeg",
+                        "meta": {"index": 0, "outputType": "audio", "voice": voice},
+                    }],
+                },
+            )
+        except Exception as e:
+            return ProviderJob(
+                job_id=f"tts-ex-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message=f"豆包语音合成异常：{e}",
+            )
 
 
 class VolcengineArkImageProvider(ModelProvider):
@@ -1052,6 +1227,378 @@ class VolcengineArkVideoProvider(ModelProvider):
         return None
 
 
+class AgnesImageProvider(ModelProvider):
+    """Agnes Image：POST /images/generations（文生图 / 图生图 / 多图合成）。"""
+
+    name = "agnes-image"
+
+    def generate(self, request: GenerationRequest) -> ProviderJob:
+        import base64
+
+        import httpx
+
+        api_key = (settings.agnes_api_key or "").strip()
+        operation = str(request.params.get("operation") or "")
+        if operation in {"裁剪", "三视图"}:
+            return MockImageProvider().generate(request)
+        if not api_key:
+            return ProviderJob(
+                job_id=f"agnes-img-no-key-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message="未配置 Agnes API Key（VIBEPAPER_AGNES_API_KEY），无法调用图像生成",
+            )
+
+        model = resolve_image_model(request.model_name)
+        prompt = build_generation_prompt(request.params)
+        if operation == "扩图":
+            prompt = (prompt or "扩展画面边缘，保持主体完整") + "，outpainting，扩图"
+        elif operation == "超分":
+            prompt = (prompt or "提升清晰度与细节") + "，高清超分，保留原构图"
+        if request.params.get("style"):
+            prompt = f"{prompt}\n风格：{request.params.get('style')}"
+        if not prompt:
+            return ProviderJob(
+                job_id=f"agnes-img-empty-{request.task_id}",
+                status="failed",
+                error_code="INVALID_INPUT",
+                error_message="图片生成需要 prompt",
+            )
+
+        size, ratio = self._size_and_ratio(request.params)
+        body: dict = {
+            "model": model,
+            "prompt": prompt[:2000],
+            "size": size,
+            "ratio": ratio,
+            "extra_body": {"response_format": "url"},
+        }
+
+        images: list[str] = []
+        primary = first_reference_image(request.params)
+        if primary:
+            images.append(_media_url_for_remote_api(str(primary)))
+        for key in ("referenceImages", "reference_images", "referenceUrls"):
+            for item in _normalize_str_list(request.params.get(key)):
+                media = _media_url_for_remote_api(item)
+                if media and media not in images:
+                    images.append(media)
+        if images:
+            body["extra_body"]["image"] = images
+
+        count = max(1, min(int(request.params.get("count", 1)), 4))
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        base = settings.agnes_base_url.rstrip("/")
+        outputs = []
+        try:
+            with httpx.Client(timeout=360.0) as client:
+                for i in range(count):
+                    resp = _httpx_retry_429(
+                        lambda: client.post(f"{base}/images/generations", headers=headers, json=body),
+                    )
+                    if resp.status_code >= 400:
+                        return ProviderJob(
+                            job_id=f"agnes-img-http-{request.task_id}",
+                            status="failed",
+                            error_code="MODEL_UNAVAILABLE",
+                            error_message=f"Agnes 图像 API 错误 HTTP {resp.status_code}: {resp.text[:400]}",
+                        )
+                    data = resp.json()
+                    url = VolcengineArkImageProvider._extract_image_url(data)
+                    if not url:
+                        return ProviderJob(
+                            job_id=f"agnes-img-bad-{request.task_id}",
+                            status="failed",
+                            error_code="MODEL_UNAVAILABLE",
+                            error_message=f"Agnes 未返回图片 URL: {data}",
+                        )
+                    out_path = Path(request.output_dir) / f"agnes_{i}.jpg"
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    if url.startswith("data:"):
+                        raw = url.split(",", 1)[-1]
+                        out_path.write_bytes(base64.b64decode(raw))
+                    else:
+                        with client.stream("GET", url, timeout=180.0) as dl:
+                            dl.raise_for_status()
+                            with out_path.open("wb") as f:
+                                for chunk in dl.iter_bytes():
+                                    f.write(chunk)
+                    outputs.append({
+                        "url": f"/api/v1/tasks/{request.task_id}/outputs/file/{out_path.name}",
+                        "file_path": str(out_path),
+                        "content_type": "image/jpeg",
+                        "meta": {
+                            "outputType": "image",
+                            "provider": self.name,
+                            "model": model,
+                            "operation": operation or "generate",
+                            "remoteUrl": url if not url.startswith("data:") else None,
+                            "index": i,
+                        },
+                    })
+            return ProviderJob(
+                job_id=f"agnes-img-{request.task_id}",
+                status="succeeded",
+                result={"outputs": outputs},
+            )
+        except Exception as e:
+            return ProviderJob(
+                job_id=f"agnes-img-err-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message=str(e)[:500],
+            )
+
+    @staticmethod
+    def _size_and_ratio(params: dict) -> tuple[str, str]:
+        explicit = str(params.get("size") or "").strip()
+        ratio = str(params.get("ratio") or "").strip()
+        resolution = str(params.get("resolution") or "").strip()
+        if not ratio and "x" in resolution.lower():
+            try:
+                w, h = (int(x) for x in resolution.lower().split("x", 1))
+                if w == h:
+                    ratio = "1:1"
+                elif w > h:
+                    ratio = "16:9" if w / h > 1.4 else "4:3"
+                else:
+                    ratio = "9:16" if h / w > 1.4 else "3:4"
+            except Exception:
+                ratio = "1:1"
+        if not ratio:
+            ratio = "1:1"
+        if explicit.upper() in {"1K", "2K", "3K", "4K"}:
+            return explicit.upper(), ratio
+        mapping = {
+            "512x512": "1K",
+            "768x768": "1K",
+            "1024x1024": "1K",
+            "1280x720": "2K",
+            "1920x1080": "2K",
+            "3840x2160": "4K",
+        }
+        size = mapping.get(resolution, settings.agnes_image_size or "2K")
+        return size, ratio
+
+
+class AgnesVideoProvider(ModelProvider):
+    """Agnes Video：POST /videos 创建任务，再按 video_id 轮询下载。"""
+
+    name = "agnes-video"
+
+    def generate(self, request: GenerationRequest) -> ProviderJob:
+        import time
+
+        import httpx
+
+        api_key = (settings.agnes_api_key or "").strip()
+        if not api_key:
+            return ProviderJob(
+                job_id=f"agnes-vid-no-key-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message="未配置 Agnes API Key（VIBEPAPER_AGNES_API_KEY），无法调用视频生成",
+            )
+
+        model = resolve_video_model(request.model_name)
+        prompt = build_generation_prompt(request.params)
+        if not prompt:
+            return ProviderJob(
+                job_id=f"agnes-vid-empty-{request.task_id}",
+                status="failed",
+                error_code="INVALID_INPUT",
+                error_message="视频生成需要 prompt",
+            )
+
+        text = prompt
+        if request.params.get("camera"):
+            text = f"{prompt}\n运镜：{request.params.get('camera')}"
+        if request.params.get("style"):
+            text = f"{text}\n风格：{request.params.get('style')}"
+
+        duration = int(request.params.get("duration") or settings.agnes_video_duration or 5)
+        duration = max(2, min(duration, 18))
+        fps = int(request.params.get("frame_rate") or request.params.get("fps") or 24)
+        fps = max(1, min(fps, 60))
+        num_frames = int(request.params.get("num_frames") or _agnes_frames_for_duration(duration, fps))
+        width, height = _agnes_wh_from_params(request.params)
+
+        body: dict = {
+            "model": model,
+            "prompt": text[:2000],
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": fps,
+        }
+        if request.params.get("negative_prompt"):
+            body["negative_prompt"] = str(request.params.get("negative_prompt"))
+        if request.params.get("seed") is not None:
+            try:
+                body["seed"] = int(request.params.get("seed"))
+            except (TypeError, ValueError):
+                pass
+
+        first = request.params.get("firstFrameUrl")
+        last = request.params.get("lastFrameUrl")
+        ref_urls = _normalize_str_list(
+            request.params.get("referenceUrls")
+            or request.params.get("referenceImages")
+            or request.params.get("reference_images"),
+        )
+        single = first_reference_image(request.params)
+        keyframe_urls: list[str] = []
+        if isinstance(first, str) and first.strip():
+            keyframe_urls.append(_media_url_for_remote_api(first.strip()))
+        if isinstance(last, str) and last.strip():
+            media = _media_url_for_remote_api(last.strip())
+            if media not in keyframe_urls:
+                keyframe_urls.append(media)
+        if len(keyframe_urls) >= 2 or str(request.params.get("mode") or "") == "keyframes":
+            body["extra_body"] = {"image": keyframe_urls or [_media_url_for_remote_api(u) for u in ref_urls[:2]], "mode": "keyframes"}
+        elif single:
+            body["image"] = _media_url_for_remote_api(str(single))
+            body["mode"] = "ti2vid"
+        elif ref_urls:
+            body["image"] = _media_url_for_remote_api(ref_urls[0])
+            body["mode"] = "ti2vid"
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        base = settings.agnes_base_url.rstrip("/")
+        # 轮询入口在 /v1 之外：https://apihub.agnes-ai.com/agnesapi
+        poll_root = base[:-3] if base.endswith("/v1") else base.rsplit("/v1", 1)[0]
+        if not poll_root:
+            poll_root = "https://apihub.agnes-ai.com"
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                create = _httpx_retry_429(
+                    lambda: client.post(f"{base}/videos", headers=headers, json=body),
+                    attempts=5,
+                    first_delay=3.0,
+                )
+                if create.status_code >= 400:
+                    return ProviderJob(
+                        job_id=f"agnes-vid-http-{request.task_id}",
+                        status="failed",
+                        error_code="MODEL_UNAVAILABLE",
+                        error_message=f"Agnes 视频创建失败 HTTP {create.status_code}: {create.text[:400]}",
+                    )
+                created = create.json()
+                video_id = created.get("video_id") or created.get("id") or created.get("task_id")
+                task_id = created.get("task_id") or created.get("id") or video_id
+                if not video_id and not task_id:
+                    return ProviderJob(
+                        job_id=f"agnes-vid-bad-{request.task_id}",
+                        status="failed",
+                        error_code="MODEL_UNAVAILABLE",
+                        error_message=f"Agnes 未返回 video_id/task_id: {created}",
+                    )
+
+                deadline = time.time() + max(60, settings.agnes_poll_timeout_seconds)
+                last_payload: dict = {}
+                poll_interval = max(5, int(settings.agnes_poll_interval_seconds or 10))
+                rate_limit_backoff = poll_interval
+                # 创建后先等待再查，避免立刻打满状态查询配额
+                time.sleep(poll_interval)
+                while time.time() < deadline:
+                    if video_id:
+                        poll = client.get(
+                            f"{poll_root}/agnesapi",
+                            headers=headers,
+                            params={"video_id": video_id, "model_name": model},
+                        )
+                    else:
+                        poll = client.get(f"{base}/videos/{task_id}", headers=headers)
+                    if poll.status_code == 429:
+                        # Agnes: video status query rate limit exceeded — 退避后继续
+                        rate_limit_backoff = min(60, max(rate_limit_backoff * 2, poll_interval * 2))
+                        time.sleep(rate_limit_backoff)
+                        continue
+                    if poll.status_code >= 400:
+                        return ProviderJob(
+                            job_id=str(video_id or task_id),
+                            status="failed",
+                            error_code="MODEL_UNAVAILABLE",
+                            error_message=f"Agnes 视频轮询失败 HTTP {poll.status_code}: {poll.text[:400]}",
+                        )
+                    rate_limit_backoff = poll_interval
+                    last_payload = poll.json() if poll.content else {}
+                    status = str(last_payload.get("status") or "").lower()
+                    if status in {"completed", "succeeded", "success", "done"}:
+                        video_url = self._extract_video_url(last_payload)
+                        if not video_url:
+                            return ProviderJob(
+                                job_id=str(video_id or task_id),
+                                status="failed",
+                                error_code="MODEL_UNAVAILABLE",
+                                error_message=f"任务成功但无视频 URL: {last_payload}",
+                            )
+                        out_path = Path(request.output_dir) / "agnes.mp4"
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        with client.stream("GET", video_url, timeout=180.0) as resp:
+                            resp.raise_for_status()
+                            with out_path.open("wb") as f:
+                                for chunk in resp.iter_bytes():
+                                    f.write(chunk)
+                        return ProviderJob(
+                            job_id=str(video_id or task_id),
+                            status="succeeded",
+                            result={
+                                "outputs": [{
+                                    "url": f"/api/v1/tasks/{request.task_id}/outputs/file/{out_path.name}",
+                                    "file_path": str(out_path),
+                                    "content_type": "video/mp4",
+                                    "meta": {
+                                        "outputType": "video",
+                                        "provider": self.name,
+                                        "model": model,
+                                        "agnesVideoId": video_id,
+                                        "agnesTaskId": task_id,
+                                        "remoteUrl": video_url,
+                                        "seconds": last_payload.get("seconds"),
+                                        "size": last_payload.get("size"),
+                                    },
+                                }],
+                            },
+                        )
+                    if status in {"failed", "error", "cancelled", "canceled"}:
+                        err = last_payload.get("error") or last_payload.get("message") or last_payload
+                        return ProviderJob(
+                            job_id=str(video_id or task_id),
+                            status="failed",
+                            error_code="MODEL_UNAVAILABLE",
+                            error_message=str(err)[:500],
+                        )
+                    time.sleep(poll_interval)
+                return ProviderJob(
+                    job_id=str(video_id or task_id),
+                    status="failed",
+                    error_code="MODEL_TIMEOUT",
+                    error_message=f"Agnes 视频任务超时: {last_payload}",
+                )
+        except Exception as e:
+            return ProviderJob(
+                job_id=f"agnes-vid-err-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message=str(e)[:500],
+            )
+
+    @staticmethod
+    def _extract_video_url(payload: dict) -> str | None:
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        for key in ("url", "video_url", "output_url"):
+            val = meta.get(key) if meta else None
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        for key in ("url", "video_url", "output_url"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        return VolcengineArkVideoProvider._extract_video_url(payload)
+
+
 class ComfyUIProvider(ModelProvider):
     """ComfyUI 适配占位：仅当配置 VIBEPAPER_COMFYUI_BASE_URL 时启用，否则不可用。"""
 
@@ -1303,16 +1850,22 @@ PROVIDER_REGISTRY: dict[str, ModelProvider] = {
     "mock-image": MockImageProvider(),
     "mock-video": MockVideoProvider(),
     "mock-audio": MockAudioProvider(),
+    "doubao-tts": DoubaoTtsProvider(),
     "mock-compose": ComposeProvider(),
     "mock-director": MockDirectorProvider(),
     "openai": _openai_text,
     "openai-text": _openai_text,
+    "agnes-text": _openai_text,
     "deepseek": _openai_text,
     "qwen": _openai_text,
-    "seedream": VolcengineArkImageProvider(),
-    "volcengine-ark-image": VolcengineArkImageProvider(),
-    "volcengine-ark": VolcengineArkVideoProvider(),
-    "seedance": VolcengineArkVideoProvider(),
+    "agnes": AgnesImageProvider(),
+    "agnes-image": AgnesImageProvider(),
+    "agnes-video": AgnesVideoProvider(),
+    # 旧方舟 provider 名保留，默认路由到 Agnes
+    "seedream": AgnesImageProvider(),
+    "volcengine-ark-image": AgnesImageProvider(),
+    "volcengine-ark": AgnesVideoProvider(),
+    "seedance": AgnesVideoProvider(),
     "comfyui": ComfyUIProvider(),
 }
 
@@ -1321,35 +1874,51 @@ def get_provider(provider_name: str, model_type: str | None = None) -> ModelProv
     modality = (model_type or "").lower()
     pname = (provider_name or "").lower()
 
-    # 按模型名优先分流（同 Key 下图/视频不同 endpoint）
+    if "agnes-video" in pname or pname == "agnes-video":
+        return PROVIDER_REGISTRY["agnes-video"]
+    # Agnes 文本必须先于图像路由，否则 agnes-2.5-flash 会被当成图
+    if (
+        pname in {"agnes-text", "openai-text", "openai", "deepseek", "qwen"}
+        or modality in {"text"}
+        or "agnes-2.5" in pname
+        or "agnes-2.5" in modality
+    ):
+        return PROVIDER_REGISTRY["openai-text"]
+    if "agnes" in pname or "agnes" in modality:
+        if modality in {"video"} or "video" in pname:
+            return PROVIDER_REGISTRY["agnes-video"]
+        return PROVIDER_REGISTRY["agnes-image"]
+
+    # 旧方舟命名统一走 Agnes
     if "seedream" in pname or "seedream" in modality:
-        return PROVIDER_REGISTRY["seedream"]
+        return PROVIDER_REGISTRY["agnes-image"]
     if "seedance" in pname or "seedance" in modality:
-        return PROVIDER_REGISTRY["seedance"]
+        return PROVIDER_REGISTRY["agnes-video"]
 
     if pname in PROVIDER_REGISTRY and pname != "mock":
-        # volcengine-ark 可能被误标在图片模型上，按模态纠正
         if pname == "volcengine-ark" and (
-            modality in {"image"} or modality.startswith("flux") or modality.startswith("seedream")
+            modality in {"image"} or modality.startswith("flux") or modality.startswith("seedream") or modality.startswith("agnes-image")
         ):
-            return PROVIDER_REGISTRY["seedream"]
+            return PROVIDER_REGISTRY["agnes-image"]
         return PROVIDER_REGISTRY[pname]
 
     if modality in {"compose"} or "compose" in modality:
         return PROVIDER_REGISTRY["mock-compose"]
     if modality in {"director"} or "director" in modality:
         return PROVIDER_REGISTRY["mock-director"]
-    if modality in {"image"} or modality.startswith("flux") or modality.startswith("sd"):
-        if settings.ark_api_key:
-            return PROVIDER_REGISTRY["seedream"]
+    if modality in {"image"} or modality.startswith("flux") or modality.startswith("sd") or modality.startswith("agnes-image"):
+        if settings.agnes_api_key:
+            return PROVIDER_REGISTRY["agnes-image"]
         return PROVIDER_REGISTRY["mock-image"]
-    if modality in {"video"} or modality.startswith("wan") or modality.startswith("kling"):
+    if modality in {"video"} or modality.startswith("wan") or modality.startswith("kling") or modality.startswith("agnes-video"):
         if pname == "mock-video":
             return PROVIDER_REGISTRY["mock-video"]
-        return PROVIDER_REGISTRY["seedance"]
-    if modality in {"audio"} or modality.startswith("music") or modality.startswith("audio"):
-        return PROVIDER_REGISTRY["mock-audio"]
-    if pname in {"openai", "openai-text", "deepseek", "qwen"} or modality in {"text"}:
+        return PROVIDER_REGISTRY["agnes-video"]
+    if modality in {"audio"} or modality.startswith("music") or modality.startswith("audio") or "tts" in pname:
+        if pname in {"doubao-tts", "mock-audio"}:
+            return PROVIDER_REGISTRY.get(pname) or PROVIDER_REGISTRY["doubao-tts"]
+        return PROVIDER_REGISTRY["doubao-tts"]
+    if pname in {"openai", "openai-text", "agnes-text", "deepseek", "qwen"} or modality in {"text"}:
         return PROVIDER_REGISTRY["openai-text"]
     if pname == "comfyui":
         return PROVIDER_REGISTRY["comfyui"]

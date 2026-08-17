@@ -22,13 +22,54 @@ def user_id(request: Request) -> int:
     return int(raw)
 
 
+def _sse_chunk_text(content: str, *, fine: bool = False) -> tuple[int, float]:
+    """返回 (step, delay)：控制分片粒度，总时长约 0.8–2.5s。"""
+    n = len(content)
+    if fine:
+        # 正式回复：更细，方便前端逐字感
+        chunks = max(24, min(160, n))
+        step = max(1, n // chunks)
+        delay = min(0.03, max(0.012, 2.0 / max(chunks, 1)))
+        return step, delay
+    chunks = max(16, min(80, n // 2 or 16))
+    step = max(4, n // chunks)
+    delay = min(0.035, max(0.018, 1.6 / max(chunks, 1)))
+    return step, delay
+
+
 def sse(events: list[dict]):
+    """SSE 管道：thinking / 正式回复按累计前缀分片推送，避免整包「啪一下」。"""
+
+    def _emit(e: dict):
+        return f"event: {e['type']}\ndata: {json.dumps(e, ensure_ascii=False, default=str)}\n\n"
+
+    def _stream_text_event(e: dict, content: str, *, fine: bool) -> None:
+        step, delay = _sse_chunk_text(content, fine=fine)
+        # 中间片只带正文，最终片带齐 meta（executionSteps 等）
+        light = {k: v for k, v in e.items() if k not in ("executionSteps", "suggestions", "nextActions")}
+        for i in range(step, len(content), step):
+            yield _emit({**light, "content": content[:i], "streaming": True})
+            time.sleep(delay)
+        yield _emit({**e, "content": content, "streaming": False})
+        time.sleep(0.03)
+
     def stream():
         for e in events:
-            yield f"event: {e['type']}\ndata: {json.dumps(e, ensure_ascii=False, default=str)}\n\n"
-            time.sleep(0.05)
+            et = e.get("type")
+            content = e.get("content")
+            if et in ("thinking", "reflection") and isinstance(content, str) and len(content) > 16:
+                yield from _stream_text_event(e, content, fine=False)
+            elif et == "assistant_message" and isinstance(content, str) and len(content) > 8:
+                yield from _stream_text_event(e, content, fine=True)
+            else:
+                yield _emit(e)
+                time.sleep(0.05)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/api/v1/agent/sessions")
@@ -96,8 +137,12 @@ def confirm(request: Request, session_id: str, action_id: str, body: dict, db: S
             status_code=400,
             detail={"code": "INVALID_INPUT", "message": "非法会话或确认 ID", "retryable": False},
         )
-    result = session_service.confirm(db, sid, uid, aid,
-                                     body.get("token", ""), bool(body.get("accept", False)))
+    result = session_service.confirm(
+        db, sid, uid, aid,
+        body.get("token", ""),
+        bool(body.get("accept", False)),
+        confirmed_action=body.get("confirmedAction") or body.get("confirmed_action") or body.get("params"),
+    )
     if not result.get("ok"):
         raise HTTPException(
             status_code=400,
@@ -122,36 +167,67 @@ def usage(request: Request, session_id: int, db: Session = Depends(get_db)):
 
 # ---------- Skill ----------
 @router.get("/api/v1/skills")
-def list_skills(request: Request, keyword: str | None = None, db: Session = Depends(get_db)):
+def list_skills(
+    request: Request,
+    keyword: str | None = None,
+    category: str | None = None,
+    db: Session = Depends(get_db),
+):
     uid = user_id(request)
-    return {"items": [{"id": s.id, "name": s.name, "description": s.description,
-                       "instructions": s.instructions, "source": s.source, "version": s.version}
-                      for s in skill_service.presets(db, uid) if not keyword or keyword.lower() in s.name.lower()]}
+    from ..services.skill_service import skill_to_dict
+
+    skill_service.ensure_builtin_skills(db)
+    items = skill_service.list(db, uid, keyword, category=category, include_disabled=True)
+    return {"items": [skill_to_dict(s) for s in items]}
+
+
+@router.get("/api/v1/skills/{skill_id}")
+def get_skill(request: Request, skill_id: int, db: Session = Depends(get_db)):
+    uid = user_id(request)
+    from ..services.skill_service import skill_to_dict
+
+    skill_service.ensure_builtin_skills(db)
+    s = skill_service.get(db, skill_id, uid)
+    if not s:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    return skill_to_dict(s)
 
 
 @router.post("/api/v1/skills")
 def create_skill(request: Request, body: dict, db: Session = Depends(get_db)):
     uid = user_id(request)
-    s = skill_service.create(db, uid, body["name"], body.get("description"), body["instructions"])
-    return {"id": s.id, "name": s.name}
+    from ..services.skill_service import skill_to_dict
+
+    try:
+        s = skill_service.create(
+            db, uid, body["name"], body.get("description"), body["instructions"],
+            category=body.get("category") or "general",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return skill_to_dict(s)
 
 
 @router.post("/api/v1/skills/from-conversation")
 def skill_from_conversation(request: Request, body: dict, db: Session = Depends(get_db)):
     uid = user_id(request)
+    from ..services.skill_service import skill_to_dict
+
     s = skill_service.from_conversation(db, uid, int(body["sessionId"]), body.get("name"))
-    return {"id": s.id, "name": s.name}
+    return skill_to_dict(s)
 
 
 @router.post("/api/v1/skills/upload")
 async def upload_skill(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
     uid = user_id(request)
+    from ..services.skill_service import skill_to_dict
+
     content = await file.read()
     try:
         s = skill_service.upload(db, uid, file.filename or "skill.md", content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"id": s.id, "name": s.name}
+    return skill_to_dict(s)
 
 
 @router.post("/api/v1/skills/{skill_id}/attach")
@@ -171,13 +247,20 @@ def attach_skill(request: Request, skill_id: int, sessionId: int, db: Session = 
 @router.put("/api/v1/skills/{skill_id}")
 def update_skill(request: Request, skill_id: int, body: dict, db: Session = Depends(get_db)):
     uid = user_id(request)
+    from ..services.skill_service import skill_to_dict
+
     try:
-        s = skill_service.update(db, skill_id, uid, body.get("name"), body.get("description"), body.get("instructions"))
+        s = skill_service.update(
+            db, skill_id, uid,
+            body.get("name"), body.get("description"), body.get("instructions"),
+            enabled=body.get("enabled"),
+            category=body.get("category"),
+        )
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e))
     if not s:
         raise HTTPException(status_code=404, detail="Skill 不存在")
-    return {"id": s.id, "name": s.name}
+    return skill_to_dict(s)
 
 
 @router.delete("/api/v1/skills/{skill_id}")
@@ -185,7 +268,6 @@ def delete_skill(request: Request, skill_id: int, db: Session = Depends(get_db))
     uid = user_id(request)
     skill = skill_service.get(db, skill_id, uid)
     if skill is None:
-        # builtin 可能 owner=0
         from ..models import Skill
         builtin = db.get(Skill, skill_id)
         if builtin and builtin.source == "builtin":

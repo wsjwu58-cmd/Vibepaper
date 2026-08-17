@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .persona import AGENT_PERSONA, PAPER_AGENT_INSTRUCTIONS
+from ..domain.workflow_rails import IMAGE_PREF_MODEL, VIDEO_PREF_MODEL
 
 
 @dataclass
@@ -106,7 +107,12 @@ def _infer_node_type(content: str) -> str:
     # 视频/短片优先——避免被「角色/形象」误判成 image
     if re.search(r"视频|短片|动画|图生视频", content, re.I):
         return "video"
-    if re.search(r"图片|形象|插画|海报|角色|人物|狼|兽|铠甲|绘画|画一张|出图|镜头", content, re.I):
+    if re.search(
+        r"图片|形象|插画|海报|角色|人物|狼|兽|铠甲|绘画|画一张|出图|镜头|"
+        r"小狗|小猫|猫咪|狗狗|宠物|动物",
+        content,
+        re.I,
+    ):
         return "image"
     if re.search(r"图片|图|image|illustration|poster", content, re.I):
         return "image"
@@ -129,9 +135,9 @@ def _plan_create_media(content: str, selected: list[int]) -> list[PlannedAction]
         "prompt": prompt,
     }
     if node_type == "image":
-        node["params"]["model"] = "doubao-seedream-5-0-260128"
+        node["params"]["model"] = IMAGE_PREF_MODEL
     elif node_type == "video":
-        node["params"]["model"] = "doubao-seedance-1-0-pro-250528"
+        node["params"]["model"] = VIDEO_PREF_MODEL
     actions: list[PlannedAction] = [
         PlannedAction(
             "create_nodes", {"nodes": [node]}, f"在画布创建 {node_type} 节点",
@@ -150,14 +156,14 @@ def _plan_create_media(content: str, selected: list[int]) -> list[PlannedAction]
 
 
 def _build_plan_reply(content: str, actions: list[PlannedAction]) -> str:
-    """根据计划步骤生成自然语言开场白。"""
+    """规则路径开场：动作型，不寒暄。"""
     summaries = [a.summary for a in actions if a.summary]
     if not summaries:
-        return "好的，我来处理你的需求。"
+        return "按你的指令开始处理。"
     if len(summaries) == 1:
-        return f"好的，{summaries[0]}。"
+        return f"{summaries[0]}。"
     joined = " → ".join(summaries[:5])
-    return f"好的，我会按顺序完成：{joined}。"
+    return f"按序执行：{joined}。"
 
 
 def _is_text_image_pipeline(content: str) -> bool:
@@ -191,7 +197,7 @@ def _plan_text_image_pipeline(content: str) -> list[PlannedAction]:
         "params": {
             "prompt": image_prompt,
             "title": theme[:40] or "图片节点",
-            "model": "doubao-seedream-5-0-260128",
+            "model": IMAGE_PREF_MODEL,
         },
         "prompt": image_prompt,
         "creativeType": "keyframe",
@@ -214,28 +220,6 @@ def _plan_text_image_pipeline(content: str) -> list[PlannedAction]:
             "chain_estimated_cost": 8,
         }, "提交文本节点生成（上游上下文）", "只提交链路起点；图片等文本就绪后自动提交，不做无源生成"),
     ]
-
-
-def _infer_next_actions(content: str, actions: list[PlannedAction], stage: str) -> list[str]:
-    """根据计划推断下一步建议。"""
-    hints: list[str] = []
-    tools = {a.tool_name for a in actions}
-    if "submit_generation" in tools:
-        for a in actions:
-            mt = (a.params or {}).get("model_type")
-            if mt == "image":
-                hints = ["图生视频", "换风格重做", "微调 Prompt 再生成"]
-            elif mt == "video":
-                hints = ["换运镜重做", "抽帧 / 裁剪", "接续剧情"]
-            elif mt == "text":
-                hints = ["生成配图", "延展三个方向", "改写文案"]
-    if "create_nodes" in tools and "submit_generation" not in tools:
-        hints = ["提交生成", "调整节点布局", "继续添加节点"]
-    if stage in ("visual_anchor", "dynamic_gen"):
-        hints = hints or ["图生视频", "添加配音", "整理画布"]
-    if not hints:
-        hints = ["梳理画布", "给我三个方向", "继续创作"]
-    return hints[:5]
 
 
 def _is_image_then_video(content: str) -> bool:
@@ -290,7 +274,7 @@ def _plan_image_then_video_pipeline(content: str, canvas: dict | None = None) ->
         "params": {
             "prompt": image_prompt,
             "title": title,
-            "model": "doubao-seedream-5-0-260128",
+            "model": IMAGE_PREF_MODEL,
         },
         "prompt": image_prompt,
         "creativeType": "keyframe",
@@ -403,8 +387,8 @@ def plan(content: str, canvas: dict | None = None, selected_nodes: list[int] | N
         from ..domain.pipeline import plan_reregenerate_stale
         return plan_reregenerate_stale(canvas).actions
     if intent == "orchestrate_workflow":
-        from ..domain.workflow_orchestrator import plan_workflow_orchestration
-        return plan_workflow_orchestration(content, canvas, selected).actions
+        # 主图走 ReAct；规则 fallback 不再搭短剧空壳
+        return []
 
     if intent in ("summarize", "copy", "directions"):
         actions.append(PlannedAction("get_canvas_summary", {}, "读取画布摘要"))
@@ -482,7 +466,7 @@ def plan(content: str, canvas: dict | None = None, selected_nodes: list[int] | N
         }, "修改节点参数", "只更新内容本体，不动其他参数；上游一改下游会标记过期"))
     elif intent == "model":
         actions.append(PlannedAction("change_model", {
-            "node_id": (selected or [None])[0], "model": "deepseek-v4-pro",
+            "node_id": (selected or [None])[0], "model": "agnes-2.5-flash",
         }, "切换模型", "切换模型影响生成质量与点数，需确认后执行"))
     elif intent == "search":
         actions.append(PlannedAction(
@@ -507,7 +491,7 @@ def _paper_fallback_reply(intent: str, canvas_context: dict | None) -> PlanResul
         reply_type={"summarize": "summary", "copy": "copy", "directions": "directions"}.get(intent, "general"),
         pipeline_stage=stage,
         suggestions=[],
-        next_actions=["配置 LLM API Key", "重新发送指令"],
+        next_actions=[],
         llm_available=False,
         degradation_note=note,
     )
@@ -532,10 +516,7 @@ def llm_plan_structured(
             return plan_advance_pipeline(canvas_context, selected_nodes)
         return plan_reregenerate_stale(canvas_context)
 
-    if intent == "orchestrate_workflow" or _is_workflow_request(content):
-        from ..domain.workflow_orchestrator import plan_workflow_orchestration
-        return plan_workflow_orchestration(content, canvas_context, selected_nodes)
-
+    # 编排不再拐进短剧脚手架；交给下方 LLM 直接出 edit/exec（或规则窄路径）
     # 先图后视频 / 多节点编排：优先规则路径（避免 LLM 把用户原话塞进 video prompt）
     if (
         _is_image_then_video(content)
@@ -554,7 +535,7 @@ def llm_plan_structured(
             reply=_build_plan_reply(content, actions),
             reply_type="general",
             pipeline_stage=stage,
-            next_actions=_infer_next_actions(content, actions, stage),
+            next_actions=[],  # 由 llm_suggest_next_actions 按上下文生成，禁止场景词表硬编码
             requires_confirmation=False,
             llm_available=True,
         )
@@ -565,13 +546,27 @@ def llm_plan_structured(
     try:
         import httpx
 
+        from ..domain.llm_prompt import build_chat_messages
+
         ctx = canvas_context or {}
         stage = detect_pipeline_stage(ctx)
         recent = recent_messages or []
         prefs = long_term_prefs or []
-        system = (
-            f"{AGENT_PERSONA}\n\n"
-            f"{skill_instructions or PAPER_AGENT_INSTRUCTIONS}\n\n"
+
+        extra_rules = (
+            "编排纪律：依赖图思维——先铺节点+连线，每个节点 params.prompt 必须独立撰写（禁止复制用户原话）；"
+            "仅 submit 当前依赖已就绪的节点；下游由 clock 唤醒后自动 submit。"
+            "长脚本先拆分镜再逐镜 Image/Video；Compose 至少 2 路视频；Upscale 基于已有素材派生。\n"
+            "连线依赖：Text→Image/Video/Audio；Image→Image/Video；Video→Video/Compose；Audio→Video。\n"
+            "只读建议（梳理/文案/方向）默认 actions 为空，除非用户要求添加到画布。\n"
+            "用户要求创建形象/图片/角色到画布时：必须 actions 含 create_nodes(type=image) 再 submit_generation；"
+            "submit_generation 的 node_id 可先留空，执行器会用刚创建的节点 ID。\n"
+            "submit_generation 必须含 estimated_cost（整数点数），执行后返回 ack 而非已完成。\n"
+            "视频参数（模型/时长/比例/分辨率/音轨）由工作流按偏好回填并做合法性校验；"
+            "你只写画面运动描述进 prompt，不要在 actions 里编造未验证的模型名或时长上限。\n"
+            "工具与 Skill 均可选调用；用户本轮指令优先级最高。"
+        )
+        output_contract = (
             "输出严格 JSON 对象（不要 Markdown）：\n"
             "{\n"
             '  "thinking": "整体推理：需求理解 → 方案权衡（若有多种拆法，说明取舍） → 模型/依赖选择理由",\n'
@@ -584,53 +579,52 @@ def llm_plan_structured(
             '  "actions": [{"tool":"...","params":{},"summary":"...","reasoning":"这步为什么这么做，1-2 句"}]\n'
             "}\n"
             "输出形式（thinking / reasoning / reply / nextActions 都会展示给用户）：\n"
-            "- thinking 与 reasoning 用创作者语言（分镜/关键帧/运镜/依赖/一致性），"
-            "像导演搭档在想给你看；禁止出现节点 id、工具名、内部字段名。\n"
-            "- reply 固定结构：先说动作结果（一两句）→ 结论总结（涉及画布/任务时逐行列状态："
-            "✅ 已完成 / ⏳ 生成中 / ⏸ 待上游就绪 / ❌ 失败及原因）→ 如有模型替换或取舍，说清理由。"
-            "不要在 reply 里写下一步建议（那走 nextActions 字段，前端可点击）。\n"
-            "- nextActions：2-4 条可执行建议（短句，如「推进视频层」「调整角色设定」）。\n"
-            "- 先动作再理由，不寒暄；主动指出你看到的节奏/一致性风险。\n"
-            "可用工具：get_canvas_summary,get_selected_nodes,list_models,search_assets,"
-            "create_nodes,connect_nodes,layout_nodes,update_node_config,delete_nodes,"
-            "change_model,replace_output,submit_generation,update_memory,clock,load_skill,check_task_status,"
-            "upscale,compose_final,extract_frames,trim_clip。\n"
-            "编排纪律：依赖图思维——先铺节点+连线，每个节点 params.prompt 必须独立撰写（禁止复制用户原话）；"
-            "仅 submit 当前依赖已就绪的节点；下游由 clock 唤醒后自动 submit。"
-            "长脚本先拆分镜再逐镜 Image/Video；Compose 至少 2 路视频；Upscale 基于已有素材派生。\n"
-            "连线依赖：Text→Image/Video/Audio；Image→Image/Video；Video→Video/Compose；Audio→Video。\n"
-            "只读建议（梳理/文案/方向）默认 actions 为空，除非用户要求添加到画布。\n"
-            "用户要求创建形象/图片/角色到画布时：必须 actions 含 create_nodes(type=image) 再 submit_generation；"
-            "submit_generation 的 node_id 可先留空，执行器会用刚创建的节点 ID。\n"
-            "submit_generation 必须含 estimated_cost（整数点数），执行后返回 ack 而非已完成。\n"
-            "视频模型默认 doubao-seedance-1-0-pro-250528（Seedance 1.0 Pro）；"
-            "非用户明确要求 1.5/2.0，禁止自行改用更高版本。\n"
-            f"画布摘要={json.dumps({k: ctx.get(k) for k in ('name','nodeCount','edgeCount','nodeTypeCounts','creativeTypeCounts','keywords','staleNodes','pipelineHint','inputChains','targetContext') if k in ctx}, ensure_ascii=False)}\n"
-            f"选中节点={selected_nodes or []}\n"
-            f"推断阶段={stage}\n"
-            f"用户偏好={prefs[:5]}\n"
-            f"最近对话={json.dumps(recent[-6:], ensure_ascii=False)[:1500]}"
+            "- thinking / reasoning：创作者语言（分镜/关键帧/运镜/依赖/一致性），"
+            "写给用户看的判断过程；禁止节点 id、工具名、内部字段名。\n"
+            "- reply 必须落在一种回复形态（临场措辞，禁止背固定模板）：\n"
+            "  · 动作型——做完说结果（已建/已接/正在生成哪一镜）；\n"
+            "  · 决策型——需拍板时摆选项；\n"
+            "  · 建议型——节奏/转场等风险 + 可执行建议；\n"
+            "  · 反对型——问题说清 + 应怎么改。\n"
+            "  先动作后理由，不寒暄；工具失败写清原因与替代方案。"
+            "不要在 reply 里重复 nextActions。\n"
+            "- nextActions：2-4 条可点击短句，服从性格层（创作术语、简洁、有意图）；"
+            "贴合当前形态与画布阶段，禁止空泛口号与固定词表。\n"
+            "- 原则层：直接帮；缺了才查；讨论可建议、指令则执行；绝不把 queued 说成成品。\n"
+            "- 规则层：真缺 id/状态才 read/query；否则 edit/exec；不暴露内部标识。"
         )
-        base = (base_url or "https://api.deepseek.com/v1").rstrip("/")
-        if "deepseek.com" in base and not base.endswith("/v1"):
+        messages = build_chat_messages(
+            user_content=content,
+            persona=AGENT_PERSONA,
+            skill_instructions=skill_instructions or PAPER_AGENT_INSTRUCTIONS,
+            extra_rules=extra_rules,
+            output_contract=output_contract,
+            include_tools=True,
+            include_skills_catalog=True,
+            recent_messages=recent,
+            long_term_prefs=prefs,
+            canvas_context=ctx,
+            selected_nodes=list(selected_nodes or []),
+            extra_context={"inferred_pipeline_stage": stage},
+        )
+        base = (base_url or "https://apihub.agnes-ai.com/v1").rstrip("/")
+        if ("agnes-ai.com" in base or "deepseek.com" in base) and not base.endswith("/v1"):
             base = f"{base}/v1"
         resp = httpx.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": content},
-                ],
+                "messages": messages,
                 "temperature": 0.3,
             },
             timeout=90,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"] or "{}"
-        match = re.search(r"\{.*\}", raw, re.S)
-        data = json.loads(match.group(0) if match else raw)
+        from ..domain.llm_json import parse_llm_json
+
+        data = parse_llm_json(raw, expect=dict)
         actions = []
         for item in data.get("actions") or []:
             tool = item.get("tool") or item.get("tool_name")
@@ -667,6 +661,87 @@ def llm_plan_structured(
         actions = plan(content, canvas_context, selected_nodes)
         return PlanResult(actions=actions, reply="", reply_type="general",
                           pipeline_stage=detect_pipeline_stage(canvas_context), llm_available=False)
+
+
+def llm_suggest_next_actions(
+    *,
+    content: str,
+    reply: str,
+    pipeline_stage: str,
+    actions: list[PlannedAction],
+    canvas_context: dict | None,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> list[str]:
+    """规则路径未带 nextActions 时，由 LLM 按当前上下文生成 2–4 条建议。失败则返回空。"""
+    if not api_key:
+        return []
+    try:
+        import httpx
+
+        ctx = canvas_context or {}
+        action_brief = [
+            {"tool": a.tool_name, "summary": a.summary}
+            for a in (actions or [])[:8]
+        ]
+        system = (
+            "你是 VibePaper 创作搭档。根据用户指令、当前回复与计划动作，"
+            "输出 2–4 条可点击的下一步短句。"
+            "服从性格层：镜头/分镜/节奏等创作术语；简洁有意图；跟随用户语言。"
+            "短句应像建议型或动作型收尾（可执行），禁止固定词表与空泛口号，"
+            "禁止节点 id / jobId / 工具名。只输出 JSON 数组，不要 Markdown。"
+        )
+        user = json.dumps(
+            {
+                "user": (content or "")[:500],
+                "reply": (reply or "")[:800],
+                "pipelineStage": pipeline_stage,
+                "actions": action_brief,
+                "canvas": {
+                    k: ctx.get(k)
+                    for k in (
+                        "nodeCount", "nodeTypeCounts", "creativeTypeCounts",
+                        "pipelineHint", "staleNodes", "keywords",
+                    )
+                    if k in ctx
+                },
+            },
+            ensure_ascii=False,
+        )
+        base = (base_url or "https://apihub.agnes-ai.com/v1").rstrip("/")
+        if ("agnes-ai.com" in base or "deepseek.com" in base) and not base.endswith("/v1"):
+            base = f"{base}/v1"
+        resp = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.4,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"] or "[]"
+        from ..domain.llm_json import parse_llm_json
+
+        data = parse_llm_json(raw, expect=list)
+        if not isinstance(data, list):
+            return []
+        out: list[str] = []
+        for item in data:
+            text = str(item).strip()
+            if text and text not in out:
+                out.append(text)
+            if len(out) >= 4:
+                break
+        return out
+    except Exception:
+        return []
 
 
 def llm_plan(content: str, canvas: dict | None, selected_nodes: list[int] | None, api_key: str,

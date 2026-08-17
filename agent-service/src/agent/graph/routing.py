@@ -50,14 +50,22 @@ def route_by_confirm(state: AgentState) -> str:
 def route_after_exec(state: AgentState) -> str:
     if state.get("pending_high_risk"):
         return "confirm"
-    for result in state.get("executed_results") or []:
+
+    results = list(state.get("executed_results") or [])
+    for result in results:
         if result.get("ack") and result.get("task_id"):
             return "wait_for_result"
-    failures = [r for r in (state.get("executed_results") or []) if not r.get("ok")]
+    failures = [r for r in results if not r.get("ok")]
     blocked = state.get("contract_violations") or []
     count = int(state.get("reflection_count") or 0)
     if (failures or blocked) and count < 2:
         return "reflect"
+    if (
+        state.get("react_mode")
+        and str(state.get("react_decision") or "") == "act"
+        and int(state.get("react_step") or 0) < int(state.get("max_react_steps") or 8)
+    ):
+        return "continue"
     return "done"
 
 

@@ -181,8 +181,6 @@ def plan_downstream_submits(
         canvas_context,
         prefer_downstream_of=completed_node_id,
     )
-    if not ready_nodes and completed_node_id is not None:
-        ready_nodes = find_submittable_nodes(canvas_context)
     actions: list[PlannedAction] = []
     for n in ready_nodes:
         action = plan_submit_for_node(n, canvas_context)

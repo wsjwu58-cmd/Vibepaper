@@ -1,4 +1,8 @@
-"""context_builder：按意图缺了才查，优先 summary 接口。"""
+"""context_builder：缺了才查，优先 summary 接口。
+
+意图识别已交给 LLM（classify_intent 节点）；此处不再用正则猜意图，
+按选中节点决定查询范围：有选中 → related，否则 summary。
+"""
 
 from __future__ import annotations
 
@@ -7,10 +11,10 @@ import logging
 
 import httpx
 
-from ...domain.dependency_graph import enrich_context_with_chains, resolve_target_context
-from ...agent.planner import classify_intent, infer_query_scope
 from ...core.config import settings
 from ...core.db import SessionLocal
+from ...domain.dependency_graph import enrich_context_with_chains, resolve_target_context
+from ...domain.llm_prompt import serialize_recent_message
 from ...models import AgentMessage
 from ...services.memory_service import memory_service
 from ...tools.registry import headers_for
@@ -57,11 +61,11 @@ def _fetch_selected_detail(canvas_id: int, user_id: int, selected: list[int]) ->
 
 def context_builder_node(state: AgentState) -> dict:
     content = state["user_content"]
-    intent = classify_intent(content)
-    scope = infer_query_scope(intent)
     user_id = state["user_id"]
     canvas_id = state.get("canvas_id")
     selected = [int(x) for x in (state.get("selected_nodes") or [])]
+    # 意图由 LLM 节点判定；此处仅按选中决定查询范围
+    scope = "related" if selected else "summary"
 
     canvas_context: dict = {}
     canvas_version = state.get("canvas_version") or 1
@@ -70,10 +74,12 @@ def context_builder_node(state: AgentState) -> dict:
         if scope == "selected" and selected:
             canvas_context = _fetch_selected_detail(canvas_id, user_id, selected)
         else:
-            canvas_context = _fetch_summary(canvas_id, user_id, selected, depth=2 if scope == "related" else 1)
+            canvas_context = _fetch_summary(
+                canvas_id, user_id, selected, depth=2 if scope == "related" else 1,
+            )
         canvas_version = int(canvas_context.get("version") or canvas_version)
 
-    if canvas_id and selected and intent in ("generate", "advance_pipeline", "update", "model"):
+    if canvas_id and selected:
         canvas_context = enrich_context_with_chains(canvas_context, selected)
         if len(selected) == 1:
             canvas_context["targetContext"] = resolve_target_context(canvas_context, selected[0])
@@ -90,8 +96,16 @@ def context_builder_node(state: AgentState) -> dict:
                 .limit(10)
                 .all()
             )
-            recent = [{"role": m.role, "type": m.msg_type, "content": (m.content or "")[:400]}
-                      for m in reversed(msgs)]
+            recent = [
+                serialize_recent_message(
+                    role=m.role,
+                    content=m.content or "",
+                    msg_type=m.msg_type or "text",
+                    meta=m.meta if isinstance(m.meta, dict) else {},
+                    content_limit=800 if (m.role or "") == "assistant" else 500,
+                )
+                for m in reversed(msgs)
+            ]
         except Exception as e:
             logger.warning("load recent messages failed: %s", e)
             db.rollback()
@@ -111,23 +125,12 @@ def context_builder_node(state: AgentState) -> dict:
         db.close()
 
     token_est = _estimate_tokens(canvas_context) + _estimate_tokens(recent)
-    events = list(state.get("events") or [])
-    events.append({
-        "type": "context",
-        "canvasSummary": {
-            "nodeCount": canvas_context.get("nodeCount", 0),
-            "edgeCount": canvas_context.get("edgeCount", 0),
-            "queryScope": scope,
-            "intentType": intent,
-            "tokenEstimate": token_est,
-        },
-    })
     logger.info(
-        "context_builder session=%s intent=%s scope=%s tokens≈%s nodes=%s",
-        state["session_id"], intent, scope, token_est, canvas_context.get("nodeCount"),
+        "context_builder session=%s scope=%s tokens≈%s nodes=%s content_len=%s",
+        state["session_id"], scope, token_est, canvas_context.get("nodeCount"), len(content or ""),
     )
     return {
-        "intent_type": intent,
+        "intent_type": state.get("intent_type") or "general",
         "query_scope": scope,
         "canvas_context": canvas_context,
         "canvas_version": canvas_version,
@@ -135,5 +138,14 @@ def context_builder_node(state: AgentState) -> dict:
         "project_memories": project_memories,
         "long_term_prefs": long_term_prefs,
         "context_token_estimate": token_est,
-        "events": events,
+        "events": [{
+            "type": "context",
+            "canvasSummary": {
+                "nodeCount": canvas_context.get("nodeCount", 0),
+                "edgeCount": canvas_context.get("edgeCount", 0),
+                "queryScope": scope,
+                "intentType": state.get("intent_type") or "pending_llm",
+                "tokenEstimate": token_est,
+            },
+        }],
     }

@@ -1,4 +1,4 @@
-"""视频任务参数：时长与预估点数随任务/模型解析，禁止硬编码。"""
+"""视频任务参数：时长与预估点数随任务/模型解析；轨道合法性由 workflow_rails 裁定。"""
 
 from __future__ import annotations
 
@@ -9,9 +9,16 @@ from typing import Any
 import httpx
 
 from ..core.config import settings
+from .workflow_rails import (
+    VIDEO_PREF_DURATION,
+    VIDEO_PREF_MODEL,
+    ParamResolveResult,
+    backfill_video_node_params,
+    resolve_video_params,
+)
 
 _DURATION_MIN = 2
-_DURATION_MAX = 12
+_DURATION_MAX = 18
 
 # 明确指「单段视频时长」的表述（避免把「30秒短剧」总量误当 clip 时长）
 _CLIP_DURATION = re.compile(
@@ -19,7 +26,8 @@ _CLIP_DURATION = re.compile(
     r"(\d+)\s*秒(?:的)?(?:视频|短片|动画|片段)|"
     r"(\d+)\s*s(?:ec)?(?:\s*video)?|"
     r"时长\s*[:：]?\s*(\d+)\s*秒|"
-    r"每(?:镜|段|个镜头)\s*(\d+)\s*秒",
+    r"每(?:镜|段|个镜头)\s*(\d+)\s*秒|"
+    r"我要\s*(\d+)\s*秒",
     re.I,
 )
 _TOTAL_SECONDS = re.compile(r"(\d+)\s*秒(?:短剧|广告|故事|视频)?", re.I)
@@ -105,7 +113,7 @@ def resolve_video_duration(
     node_params: dict | None = None,
     shot_count: int | None = None,
 ) -> int:
-    """按优先级解析视频时长：总量均分 → 文案 clip → 节点参数 → 模型默认。"""
+    """按优先级解析视频时长：总量均分 → 文案 clip → 节点参数 → 偏好默认。"""
     total = parse_total_seconds_from_text(content)
     if total is not None and shot_count and shot_count > 0:
         if re.search(r"短剧|广告|故事|镜头", content or "", re.I):
@@ -136,16 +144,15 @@ def resolve_video_duration(
         except (TypeError, ValueError):
             pass
 
-    # 模型目录未给出时与 generation-service provider 下限一致
-    return _clamp_duration(5)
+    return _clamp_duration(VIDEO_PREF_DURATION)
 
 
-# Agent / 节点默认视频模型：Seedance 1.0 Pro（勿默默升到 1.5 / 2.0）
-DEFAULT_VIDEO_MODEL = "doubao-seedance-1-0-pro-250528"
+# Agent / 节点默认视频模型：偏好 Agnes Video V2.0（由 workflow_rails 回填）
+DEFAULT_VIDEO_MODEL = VIDEO_PREF_MODEL
 
 
 def resolve_video_model_name(preferred: str | None = None) -> str:
-    """解析视频模型名；无显式指定时固定 Seedance 1.0 Pro。"""
+    """解析视频模型名；无显式指定时用偏好模型。"""
     if preferred:
         model = get_video_model(preferred)
         name = str(model.get("name") or preferred).strip()
@@ -189,30 +196,44 @@ def build_video_task_params(
     extra: dict | None = None,
     node_params: dict | None = None,
 ) -> dict[str, Any]:
-    """统一构造视频节点/提交任务参数。"""
+    """统一构造视频节点/提交任务参数（轨道回填 + 兼容换模）。"""
     nodes = (canvas or {}).get("nodes") or []
     ids = set(int(x) for x in (selected_ids or []))
     selected_nodes = [n for n in nodes if n.get("id") in ids] if ids else []
 
-    model = resolve_video_model_name(model_name)
+    node_params = backfill_video_node_params(node_params, user_content=content)
+    preferred = model_name or node_params.get("model") or DEFAULT_VIDEO_MODEL
     duration = resolve_video_duration(
         content=content,
-        model_name=model,
+        model_name=str(preferred),
         selected_nodes=selected_nodes,
         node_params=node_params,
         shot_count=shot_count,
     )
-    model_params = {"prompt": prompt, "count": 1, "duration": duration, **(extra or {})}
-    model_info = get_video_model(model)
-    defaults = model_info.get("defaultParams") or {}
-    if defaults.get("resolution") and "resolution" not in model_params:
-        model_params["resolution"] = defaults["resolution"]
-
+    confirmed = None
+    if extra and isinstance(extra.get("confirmedAction"), dict):
+        confirmed = extra.get("confirmedAction")
+    elif isinstance((node_params or {}).get("confirmedAction"), dict):
+        confirmed = (node_params or {}).get("confirmedAction")
+    resolved: ParamResolveResult = resolve_video_params(
+        preferred_model=str(preferred),
+        duration=duration,
+        ratio=str(node_params.get("ratio") or ""),
+        resolution=str(node_params.get("resolution") or ""),
+        generate_audio=node_params.get("generate_audio"),
+        extra={k: v for k, v in (extra or {}).items() if k != "confirmedAction"},
+        prompt=prompt,
+        user_content=content,
+        confirmed_action=confirmed,
+    )
+    model_params = resolved.params
     return {
-        "model": model,
-        "duration": duration,
+        "model": resolved.model,
+        "duration": int(model_params["duration"]),
         "model_params": model_params,
-        "estimated_cost": estimate_video_cost(model, model_params),
+        "estimated_cost": estimate_video_cost(resolved.model, model_params),
+        "workflow_notes": list(resolved.notes),
+        "switched": resolved.switched,
     }
 
 
@@ -227,8 +248,11 @@ def video_submit_from_node(node: dict, *, content: str = "", shot_count: int | N
         node_params=params,
         shot_count=shot_count,
     )
-    return {
+    out = {
         "model_type": "video",
         "model_params": task["model_params"],
         "estimated_cost": task["estimated_cost"],
     }
+    if task.get("workflow_notes"):
+        out["workflow_notes"] = task["workflow_notes"]
+    return out

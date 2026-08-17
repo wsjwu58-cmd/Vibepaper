@@ -11,6 +11,22 @@ from .confirmer import confirmer_node
 from .clock_node import clock_node
 from .reply_builder import reply_builder_node
 from .memory_updater import memory_updater_node
+from .react_agent import react_agent_node  # 旁路保留；主图走 create_plan
+from .orchestration_nodes import (
+    acquire_context_node,
+    answer_discussion_node,
+    classify_intent_node,
+    create_plan_node,
+    fallback_node,
+    finalize_node,
+    ingest_node,
+    load_skill_node,
+    plan_recovery_node,
+    reconcile_canvas_node,
+    request_user_input_node,
+    select_skill_node,
+    validate_plan_node,
+)
 
 __all__ = [
     "check_task_status_node",
@@ -26,4 +42,18 @@ __all__ = [
     "clock_node",
     "reply_builder_node",
     "memory_updater_node",
+    "react_agent_node",
+    "ingest_node",
+    "classify_intent_node",
+    "answer_discussion_node",
+    "fallback_node",
+    "acquire_context_node",
+    "select_skill_node",
+    "load_skill_node",
+    "create_plan_node",
+    "validate_plan_node",
+    "request_user_input_node",
+    "reconcile_canvas_node",
+    "plan_recovery_node",
+    "finalize_node",
 ]

@@ -7,10 +7,11 @@ from agent.graph.nodes.reply_builder import reply_builder_node
 
 
 def test_resolve_text_modality_to_concrete_model():
-    assert resolve_submit_model("text") == "deepseek-v4-pro"
-    assert resolve_submit_model("text", model_params={"model": "deepseek-v4-flash"}) == "deepseek-v4-flash"
-    assert resolve_submit_model("deepseek-chat") == "deepseek-chat"
-    assert resolve_submit_model("video").startswith("doubao-seedance")
+    assert resolve_submit_model("text") == "agnes-2.5-flash"
+    assert resolve_submit_model("text", model_params={"model": "deepseek-v4-flash"}) == "agnes-2.5-flash"
+    assert resolve_submit_model("deepseek-chat") == "agnes-2.5-flash"
+    assert resolve_submit_model("video").startswith("agnes-video")
+    assert resolve_submit_model("image").startswith("agnes-image")
 
 
 def test_compose_never_resolves_to_seedance():
@@ -19,7 +20,7 @@ def test_compose_never_resolves_to_seedance():
     assert resolve_submit_model(
         "video",
         model_params={"operation": "compose"},
-        node_model_ref="doubao-seedance-1-0-pro-250528",
+        node_model_ref="agnes-video-v2.0",
     ) == "compose-1.0"
 
 
@@ -63,6 +64,7 @@ def test_task_status_success_reply_not_silenced_when_downstream_queued():
     out = reply_builder_node(state)
     assert out["reply"]
     assert "总脚本" in out["reply"]
+    assert "后台生成中" not in out["reply"]
     assert any(e.get("type") == "assistant_message" for e in out["events"])
 
 

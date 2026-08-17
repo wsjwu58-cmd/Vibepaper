@@ -9,7 +9,7 @@ from ..state import AgentState
 
 
 def memory_updater_node(state: AgentState) -> dict:
-    events = list(state.get("events") or [])
+    events: list[dict] = []
     state_view = {
         "user_id": state["user_id"],
         "canvas_id": state.get("canvas_id"),

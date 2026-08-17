@@ -60,13 +60,32 @@ def test_confirm_prompt_shows_chain_total():
 
 
 def test_short_drama_root_submit_carries_chain_cost():
+    from agent.domain.dependency_scheduler import DEFAULT_COST
+    from agent.domain.video_task import estimate_video_cost
     from agent.domain.workflow_orchestrator import plan_short_drama_workflow
 
     result = plan_short_drama_workflow("做一个30秒短剧，3个镜头", None)
     submits = [a for a in result.actions if a.tool_name == "submit_generation"]
     assert len(submits) == 1
-    # 链路费 = 分镜 8 + 首帧 8×3 + 视频(默认估价 30)×3 + 成片 15
-    assert submits[0].params["chain_estimated_cost"] == 8 + 24 + 90 + 15
+    creates = [a for a in result.actions if a.tool_name == "create_nodes"]
+    video_params = {}
+    for a in creates:
+        for n in a.params.get("nodes") or []:
+            if n.get("type") == "video":
+                video_params = n.get("params") or {}
+                break
+    per_video = estimate_video_cost(
+        str(video_params.get("model") or ""),
+        {"duration": video_params.get("duration"), "count": 1},
+    )
+    # 链路费 = 分镜 + 首帧×3 + 视频×3 + 成片（视频单价随目录/偏好估价）
+    expected = (
+        DEFAULT_COST["text"]
+        + DEFAULT_COST["image"] * 3
+        + per_video * 3
+        + DEFAULT_COST["compose"]
+    )
+    assert submits[0].params["chain_estimated_cost"] == expected
     assert "合计约" in result.reply
 
 
@@ -94,7 +113,7 @@ def test_reregenerate_stale_uses_node_prompt_and_title():
     assert submits[0].params["model_params"]["prompt"] == own_prompt
     assert submits[0].summary == "重跑「镜头1首帧」"
     assert "节点 9" not in result.reply
-    assert result.next_actions == ["重跑「镜头1首帧」"]
+    assert result.next_actions == []
 
 
 def test_reregenerate_stale_compose_uses_compose_final():
@@ -223,8 +242,8 @@ def test_reregenerate_stale_has_thinking_and_reasoning():
     assert submits and all(a.reasoning for a in submits)
 
 
-def test_reply_builder_collects_plan_reasoning_not_thinking_monologue():
-    """图一样式：thinking 不进执行记录；理由挂在 plan_step.reasoning。"""
+def test_reply_builder_collects_thinking_as_reasoning_block():
+    """图二样式：thinking → 执行记录「推理过程」；plan_step.reasoning →「为什么这么做」。"""
     from agent.graph.nodes.reply_builder import _collect_execution_steps
 
     state = {
@@ -237,13 +256,14 @@ def test_reply_builder_collects_plan_reasoning_not_thinking_monologue():
     }
     steps = _collect_execution_steps(state)
     kinds = [s["kind"] for s in steps]
-    assert kinds == ["plan", "result"]
-    assert all(s["kind"] != "reasoning" for s in steps)
-    assert steps[0]["reasoning"] == "独立成节点，可单独重跑"
+    assert kinds == ["reasoning", "plan", "result"]
+    assert steps[0]["label"] == "推理过程"
+    assert "full pipeline" in steps[0]["summary"]
+    assert steps[1]["reasoning"] == "独立成节点，可单独重跑"
 
 
 def test_exec_reply_has_status_markers_and_next_steps():
-    from agent.graph.nodes.reply_builder import _build_reply_from_results
+    from agent.graph.nodes.reply_builder import _build_reply_from_results, reply_builder_node
 
     state = {
         "executed_results": [
@@ -258,6 +278,27 @@ def test_exec_reply_has_status_markers_and_next_steps():
     }
     reply = _build_reply_from_results(state)
     assert "✅" in reply and "2 个节点" in reply
-    assert "⏳" in reply and "后台生成中" in reply
+    assert "后台生成中" not in reply
     assert "❌" in reply and "并发任务数达上限" in reply
     assert "task_id" not in reply and "t1" not in reply
+
+
+def test_reply_builder_does_not_invent_next_actions():
+    """执行结果不得按模型类型硬编码下一步建议词表。"""
+    from agent.graph.nodes.reply_builder import reply_builder_node
+
+    state = {
+        "reply": "已提交",
+        "reply_type": "general",
+        "pipeline_stage": "visual_anchor",
+        "executed_results": [
+            {"tool": "submit_generation", "ok": True, "ack": True, "task_id": "t1",
+             "model_type": "image", "data": {}},
+        ],
+        "next_actions": [],
+        "events": [],
+    }
+    out = reply_builder_node(state)
+    assert out["next_actions"] == []
+    msg = next(e for e in out["events"] if e.get("type") == "assistant_message")
+    assert msg.get("nextActions") == []

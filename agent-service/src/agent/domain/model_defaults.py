@@ -6,12 +6,19 @@ from ..core.config import settings
 from .video_task import DEFAULT_VIDEO_MODEL
 
 MODALITY_ALIASES = frozenset({"text", "image", "video", "audio", "compose", "director"})
+TEXT_MODEL_ALIASES = {
+    "deepseek-v4-pro": "agnes-2.5-flash",
+    "deepseek-v4-flash": "agnes-2.5-flash",
+    "deepseek-chat": "agnes-2.5-flash",
+    "qwen-max": "agnes-2.5-flash",
+    "gpt-4o-mini": "agnes-2.5-flash",
+}
 
 _DEFAULTS = {
-    "text": lambda: (settings.llm_model or "deepseek-v4-pro").strip() or "deepseek-v4-pro",
-    "image": lambda: "doubao-seedream-5-0-260128",
+    "text": lambda: (settings.llm_model or "agnes-2.5-flash").strip() or "agnes-2.5-flash",
+    "image": lambda: "agnes-image-2.1-flash",
     "video": lambda: DEFAULT_VIDEO_MODEL,
-    "audio": lambda: "audio-1.0",
+    "audio": lambda: "doubao-tts",
     "compose": lambda: "compose-1.0",
     "director": lambda: "director-1.0",
 }
@@ -38,7 +45,7 @@ def resolve_submit_model(
             continue
         name = str(raw).strip()
         if name and name.lower() not in MODALITY_ALIASES:
-            return name
+            return TEXT_MODEL_ALIASES.get(name.lower(), name)
 
     if node_model_ref:
         ref = str(node_model_ref).strip()
@@ -46,7 +53,7 @@ def resolve_submit_model(
             # 合成节点上可能残留 seedance modelRef，不能跟着走
             if str(model_type or "").lower() == "compose":
                 return "compose-1.0"
-            return ref
+            return TEXT_MODEL_ALIASES.get(ref.lower(), ref)
 
     mt = (model_type or "text").strip()
     if not mt:
@@ -54,4 +61,4 @@ def resolve_submit_model(
     if mt.lower() in MODALITY_ALIASES:
         factory = _DEFAULTS[mt.lower()]
         return factory()
-    return mt
+    return TEXT_MODEL_ALIASES.get(mt.lower(), mt)

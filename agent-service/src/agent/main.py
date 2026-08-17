@@ -44,6 +44,7 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         skill_service.ensure_paper_agent(db)
+        skill_service.ensure_builtin_skills(db)
     except Exception:
         logger.exception("ensure paper-agent-default failed")
     finally:

@@ -9,7 +9,10 @@ EXPLICIT_EXEC = re.compile(
     re.I,
 )
 
-_CONFIRM = re.compile(r"^(确认|确定|好的|执行|继续|同意|ok|yes|y)$", re.I)
+_CONFIRM = re.compile(
+    r"^(确认|确定|好的|好|是|是的|可以|行|执行|继续|同意|ok|yes|y)$",
+    re.I,
+)
 _CANCEL = re.compile(r"^(取消|不要|算了|拒绝|no|n)$", re.I)
 
 

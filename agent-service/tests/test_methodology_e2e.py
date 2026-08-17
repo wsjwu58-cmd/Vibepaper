@@ -136,21 +136,25 @@ def test_infer_node_type_media_over_subject():
     assert _infer_node_type("写一段旁白配音") == "audio"
 
 
-def test_llm_plan_structured_routes_short_drama_to_rules():
-    """有 LLM key 时也走规则编排，保证七大原则不被 LLM 绕开。"""
+def test_llm_plan_structured_no_longer_scaffolds_short_drama():
+    """编排主路径已迁 ReAct；此处不再硬搭短剧空壳脚手架。"""
     result = llm_plan_structured(
         content=USER_SHORT_DRAMA,
         canvas_context={"nodes": [], "edges": []},
         selected_nodes=[],
         recent_messages=[],
         skill_instructions="",
-        api_key="sk-test",  # 有 key 也不该走 LLM
+        api_key="sk-test",
         base_url="https://example.invalid",
         model="dummy",
     )
-    assert_methodology(result, USER_SHORT_DRAMA, expect_multi_unit=True)
-    submits = [a for a in result.actions if a.tool_name == "submit_generation"]
-    assert len(submits) == 1 and submits[0].params["model_type"] == "text"
+    creates = [a for a in result.actions if a.tool_name == "create_nodes"]
+    total_nodes = sum(len((a.params or {}).get("nodes") or []) for a in creates)
+    assert total_nodes < 6
+    for a in creates:
+        for n in a.params.get("nodes") or []:
+            p = str(n.get("prompt") or (n.get("params") or {}).get("prompt") or "")
+            assert "请直接写出" not in p
 
 
 def test_character_card_only_when_requested():

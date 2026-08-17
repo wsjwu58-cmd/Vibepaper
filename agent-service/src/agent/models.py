@@ -64,7 +64,8 @@ class Skill(Base):
     name = Column(String(128), nullable=False)
     description = Column(Text)
     instructions = Column(Text)
-    source = Column(String(32), default="manual")  # manual / from_conversation / upload
+    source = Column(String(32), default="manual")  # manual / from_conversation / upload / builtin
+    category = Column(String(32), default="general")  # image / video / text / canvas / general
     version = Column(Integer, default=1)
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)

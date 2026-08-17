@@ -89,6 +89,30 @@ def _shot_beat(shot_index: int | None) -> str:
     return _SHOT_BEATS[(shot_index - 1) % len(_SHOT_BEATS)]
 
 
+def _norm_cmp(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip())
+
+
+def is_verbatim_user_dump(prompt: str, user_content: str) -> bool:
+    """节点 prompt 是否只是用户原话/主题原样粘贴（禁止作为工作流节点正文）。"""
+    p = _norm_cmp(prompt)
+    u = _norm_cmp(user_content)
+    if not p or not u or len(p) < 4:
+        return False
+    if p == u:
+        return True
+    theme = _norm_cmp(extract_theme(user_content))
+    if theme and p == theme:
+        return True
+    goal = _norm_cmp(extract_visual_goal(user_content))
+    if goal and p == goal:
+        return True
+    # 「主题（角色设定）」这类只加短后缀的粘贴
+    if theme and theme in p and len(p) <= len(theme) + 16:
+        return True
+    return False
+
+
 def build_node_prompt(
     *,
     role: str,
@@ -100,150 +124,103 @@ def build_node_prompt(
     goal: str = "",
     extra: dict[str, Any] | None = None,
 ) -> str:
-    """为单个节点生成独立 Prompt。
+    """按节点角色写生成指令：主题只作题材，禁止把用户原话当成节点 prompt。
 
-    - script/shot/character/text：整合用户方向的创作简报（发给文本模型产出正文）
-    - keyframe/image：只写本镜静帧画面（形象细节由方向给出，不写运镜）
-    - clip/video：只写本次运镜/动作；形象靠上游首帧 reference，不复述外貌
+    具体剧情/对白/构图正文优先由 Creative Planner（LLM）填写；本函数是角色化兜底。
     """
     theme = extract_theme(user_theme)
-    direction = goal or theme or "见用户创作意图"
+    direction = (goal or theme or "").strip()
     n = shot_index or 1
     total = shot_count or 3
     motion = _motion_hint(shot_index)
     beat = _shot_beat(shot_index)
-    extra = extra or {}
+    _ = extra or {}
+
+    if not direction:
+        return ""
 
     if role == "script":
         return (
-            f"请直接写出短剧【总脚本】正文（不要复述指令）。\n"
-            f"创作方向：{direction}\n"
-            f"必须包含：主要人物与关系、核心冲突、视觉基调、情绪弧线；"
-            f"300–500 字，可被拆成 {total} 个镜头。\n"
-            f"开篇即进入故事，勿写「主题：」「要求：」这类元说明。"
+            f"写总脚本（主题：{direction}）。"
+            f"给出人物关系、本集冲突、可表演对白、场景动作与集尾钩子。"
+            f"不要复述用户原指令，不要写工作流步骤。"
         )
-
     if role == "character":
         return (
-            f"请直接写出【角色卡】正文（可落地的视觉规格）。\n"
-            f"创作方向：{direction}\n"
-            f"覆盖：外观（体型/毛色或肤色/服装/标志道具）、性格关键词 2–3 个、"
-            f"跨镜头一致性约束。不要抄写总脚本原文。"
+            f"写角色卡（主题：{direction}）：外形、服装、辨识特征、跨镜一致性约束。"
+            f"不要复制用户原话。"
         )
-
     if role == "shot":
         return (
-            f"请直接输出【分镜表】，严格 {total} 行，每行格式：\n"
-            f"镜号 | 景别 | 画面描述 | 运镜 | 时长(秒)\n"
-            f"创作方向：{direction}\n"
-            f"人物与基调对齐上游总脚本（由参考文本提供）；"
-            f"不要跳镜、不要合并多镜、不要粘贴脚本原文。"
+            f"把「{direction}」拆成 {total} 个可执行镜头："
+            f"镜号、景别、动作、对白要点。每镜独立可画。"
         )
-
     if role == "keyframe":
-        # 静帧：写本镜画面方向；上游分镜/角色通过 reference 喂入，不在此粘贴全文
         return (
-            f"镜头{n}首帧（静帧，禁止运镜/动态描述）。\n"
-            f"故事方向：{direction}\n"
-            f"本镜节拍：{beat}\n"
-            f"说清：主体位置、景别、光影、色彩；与分镜第 {n} 镜对齐。"
-            f"形象细节以参考栏上游（分镜/角色卡）为准，勿整段复述脚本。"
+            f"镜头{n}/{total}静帧（主题：{direction}）。节拍：{beat}。"
+            f"写构图、光影、主体姿态；不要复述用户整句指令。"
         )
-
     if role == "clip":
-        # 视频：只写本次动作；形象由首帧 reference 锁定
+        # 镜头视频：形象靠上游首帧 reference；prompt 只写运镜与节拍
         return (
-            f"镜头{n}视频（图生视频）。\n"
-            f"运镜与动作：{motion}，时长约 {duration} 秒；节拍：{beat}。\n"
-            f"延续首帧的构图、形象与光线，只描述本次新增的运动与情绪变化；"
-            f"不要复述角色外貌或重写整段故事。"
+            f"镜头{n}：{motion}，约 {duration}s。{beat}。"
+            f"严格延续参考首帧的主体、构图、服装与色调，只增加自然动态，勿重新创造形象。"
         )
-
     if role == "audio":
-        return (
-            f"为短剧撰写旁白/配音文案。\n"
-            f"方向：{direction}\n"
-            f"语气：{tone}；与分镜节奏对齐，每句对应一镜或一组镜头。"
-        )
-
+        return f"旁白/配音（主题：{direction}），语气：{tone}。写可录制的短句，不要复述用户原指令。"
     if role == "composite":
-        return (
-            f"按镜号顺序拼接 {total} 段视频成片。"
-            f"镜头间硬切，片头片尾可淡入淡出；保持色调一致。"
-        )
-
+        return f"按镜号顺序拼接 {total} 段成片，硬切，色调与叙事连贯。主题方向：{direction}。"
     if role == "image":
-        return (
-            f"画面主体：{direction}\n"
-            f"说清外形、姿态、场景、光影与风格；静帧构图完整，可单独成图。"
-            f"禁止运镜描述。"
-        )
-
+        return f"静帧画面（主题：{direction}）。构图清晰，主体完整，光影明确。不要复述用户原指令。"
     if role == "video":
         return (
-            f"画面内容方向：{direction}\n"
-            f"运镜：{motion}；时长约 {duration} 秒。"
-            f"若有首帧参考图，延续其形象与光线，只写本次动态。"
+            f"短视频（主题：{direction}）。运镜：{motion}，约 {duration}s。"
+            f"只写动态与镜头运动，不要把用户原话当旁白。"
         )
-
     if role == "text":
-        return (
-            f"产出方向：{direction}\n"
-            f"结构清晰，可直接作为下游节点的上下文参考；开篇即进入正文。"
-        )
-
-    # fallback
-    return f"创作方向：{direction}"
-
-
-def prompt_for_image_then_video(user_content: str, *, duration: int = 5) -> tuple[str, str]:
-    """图→视频：图写静帧方向，视频只写运镜（形象靠首帧 reference）。"""
-    goal = extract_visual_goal(user_content) or extract_theme(user_content)
-    image_prompt = build_node_prompt(role="image", user_theme=user_content, goal=goal)
-    video_prompt = build_node_prompt(
-        role="video",
-        user_theme=user_content,
-        goal=goal,
-        duration=duration,
+        return f"按主题「{direction}」写出本节点应交付的文本，不要复述用户原指令。"
+    return (
+        f"按角色「{role}」生成（主题：{direction}）。不要复述用户原指令。"
     )
-    return image_prompt, video_prompt
 
 
 def ensure_node_prompt(node: dict, user_content: str = "") -> dict:
-    """create_nodes 兜底：节点缺少 prompt 时按 type/creativeType 自动补全。"""
+    """create_nodes 兜底：缺 prompt 或原样粘贴用户指令时，按节点角色重写。"""
     out = dict(node)
     params = dict(out.get("params") or out.get("config") or {})
     existing = str(out.get("prompt") or params.get("prompt") or "").strip()
-    if len(existing) >= 20:
-        return out
-    ntype = str(out.get("type") or "text")
-    creative = str(out.get("creativeType") or out.get("creative_type") or "")
-    role_map = {
-        "keyframe": "keyframe",
-        "clip": "clip",
-        "script": "script",
-        "shot": "shot",
-        "character": "character",
-        "composite": "composite",
-        "audio": "audio",
-    }
-    role = role_map.get(creative) or {
-        "image": "image",
-        "video": "video",
-        "audio": "audio",
-        "text": "text",
-    }.get(ntype, "text")
-    filled = build_node_prompt(
-        role=role,
-        user_theme=user_content or existing,
-        goal=extract_visual_goal(user_content) if user_content else existing,
+    role = str(
+        out.get("creativeType") or out.get("creative_type") or out.get("type") or "text"
     )
+    dumped = bool(user_content) and is_verbatim_user_dump(existing, user_content)
+    if len(existing) >= 8 and not dumped:
+        return out
+    filled = build_node_prompt(role=role, user_theme=user_content)
+    if not filled:
+        filled = (extract_visual_goal(user_content) or extract_theme(user_content) or "").strip()
+    if not filled:
+        return out
     params["prompt"] = filled
     if not params.get("title"):
-        params["title"] = extract_visual_goal(user_content)[:40] or filled[:40]
+        params["title"] = (extract_theme(user_content) or filled)[:40]
     out["params"] = params
     out["prompt"] = filled
     return out
+
+
+def prompt_for_image_then_video(user_content: str, *, duration: int = 5) -> tuple[str, str]:
+    """图→视频：图写静帧方向；视频只写运镜 + 忠实首帧（形象靠 firstFrameUrl，不靠重述主体）。"""
+    goal = extract_visual_goal(user_content) or extract_theme(user_content)
+    image_prompt = build_node_prompt(role="image", user_theme=user_content, goal=goal)
+    motion = _motion_hint(None)
+    # 刻意不把 goal 再写进视频 prompt，避免文生漂移盖过参考图
+    video_prompt = (
+        f"运镜：{motion}，约 {duration}s。"
+        f"严格保持与参考首帧同一主体、构图、服装与色调；只增加自然动态，勿重新创造形象。"
+    )
+    if goal:
+        video_prompt = f"{goal}。{video_prompt}"
+    return image_prompt, video_prompt
 
 
 def prompt_for_media_create(user_content: str, node_type: str, creative_type: str | None = None) -> str:

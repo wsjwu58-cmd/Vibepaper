@@ -220,11 +220,16 @@ def _node_spec(
         "prompt": prompt,
     }
     if node_type == "image":
-        params.setdefault("model", "doubao-seedream-5-0-260128")
+        from .workflow_rails import IMAGE_PREF_MODEL
+        params.setdefault("model", IMAGE_PREF_MODEL)
     elif node_type == "video":
         model = resolve_video_model_name(params.get("model"))
         params["model"] = model
-        if "duration" not in params:
+        # 轨道参数回填（时长/比例/分辨率/音轨），不写创意正文
+        from .workflow_rails import backfill_video_node_params
+        params.update(backfill_video_node_params(params, user_content=task_content))
+        params["model"] = model
+        if "duration" not in params or params.get("duration") is None:
             params["duration"] = resolve_video_duration(
                 content=task_content,
                 model_name=model,
@@ -341,9 +346,15 @@ def plan_short_drama_workflow(content: str, canvas_context: dict | None = None) 
 
     video_nodes = []
     base_vid = kf_base + shot_count
+    from .video_task import resolve_video_duration
+    clip_duration = resolve_video_duration(content=content, shot_count=shot_count)
     for i in range(shot_count):
         clip_prompt = build_node_prompt(
-            role="clip", user_theme=theme, shot_index=i + 1, shot_count=shot_count, duration=5,
+            role="clip",
+            user_theme=theme,
+            shot_index=i + 1,
+            shot_count=shot_count,
+            duration=clip_duration,
         )
         video_nodes.append(_node_spec(
             "video", "clip", f"镜头{i + 1}视频",
@@ -444,7 +455,7 @@ def plan_short_drama_workflow(content: str, canvas_context: dict | None = None) 
             f"主轮次只提交链起点总脚本，下游全部按依赖自动推进。"
         ),
         reply=(
-            f"好的，已按依赖图编排 {shot_count} 镜头链路：{chain_label}。"
+            f"已按依赖图编排 {shot_count} 镜头链路：{chain_label}。"
             f"每个节点已写入独立 Prompt；总脚本已提交生成（queued 回执，不是成品），"
             f"下游节点将在依赖就绪后自动开始生成，我会持续跟进。"
             f"整条链路预估合计约 {DEFAULT_COST['text'] + chain_estimated} 点（含后续自动提交）。"
@@ -452,12 +463,7 @@ def plan_short_drama_workflow(content: str, canvas_context: dict | None = None) 
         ),
         reply_type="pipeline",
         pipeline_stage=stage or "storyboard",
-        next_actions=[
-            "查看画布节点与连线",
-            "调整某一镜的 Prompt",
-            "添加旁白音频",
-            "整理画布布局",
-        ],
+        next_actions=[],
         requires_confirmation=True,
     )
     from .methodology import audit_plan_result
@@ -490,7 +496,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             reply="画布为空，已创建总脚本节点。请补充主题/剧情后说「拆分分镜」。",
             reply_type="pipeline",
             pipeline_stage="text_base",
-            next_actions=["写入脚本内容", "拆分分镜", "导入参考素材"],
+            next_actions=[],
         )
 
     # 有脚本无分镜 → 分镜
@@ -520,7 +526,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             reply="已创建分镜节点并连接总脚本。请完善分镜后说「生成首帧」或指定镜头数。",
             reply_type="pipeline",
             pipeline_stage="storyboard",
-            next_actions=["生成首帧", "逐镜头创建 Image 节点", "调整分镜文案"],
+            next_actions=[],
         )
 
     # 有分镜无首帧 → 为每个 shot 或选中项创建 keyframe
@@ -577,7 +583,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             reply=reply,
             reply_type="pipeline",
             pipeline_stage="visual_anchor",
-            next_actions=["推进视频层", "换风格重做首帧", "调整某一镜构图"],
+            next_actions=[],
             requires_confirmation=is_node_ready(shot),
         )
 
@@ -641,7 +647,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             reply=reply,
             reply_type="pipeline",
             pipeline_stage="dynamic_gen",
-            next_actions=["拼接成片", "添加旁白", "换运镜重做"],
+            next_actions=[],
             requires_confirmation=ready_count > 0,
         )
 
@@ -694,32 +700,70 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             reply=reply,
             reply_type="pipeline",
             pipeline_stage="post_production",
-            next_actions=["超分高清", "抽帧 / 裁剪", "导出分享"],
+            next_actions=[],
             requires_confirmation=needs_confirm,
         )
 
-    # 已有成片 → upscale 派生建议
-    if ws.compose_nodes or ws.ready_clips:
-        target = (selected_nodes or [None])[0]
-        if not target and ws.compose_nodes:
-            target = ws.compose_nodes[0]["id"]
-        elif not target and ws.ready_clips:
-            target = ws.ready_clips[0]["id"]
-        if target:
+    # 已有成片 → 优先提交/重跑合成；超分需用户显式说「超分」
+    if ws.compose_nodes:
+        from .dependency_scheduler import DEFAULT_COST, is_node_ready
+
+        compose = ws.compose_nodes[0]
+        nid = compose.get("id")
+        params = compose.get("params") or {}
+        title = str(params.get("title") or "成片")
+        prompt = str(compose.get("prompt") or params.get("prompt") or "").strip()
+        if len(prompt) < 8:
+            prompt = build_node_prompt(
+                role="composite", user_theme="成片合成",
+                shot_count=max(2, len(ws.clip_nodes) or 2),
+            )
+        if not is_node_ready(compose):
             actions.append(PlannedAction(
-                "upscale",
-                {"node_id": target, "model_type": "video", "estimated_cost": 12},
-                "对成品/片段超分（派生增强）",
-                "超分走派生增强而非覆盖：源保留可回退，不满意可单独重跑",
+                "compose_final",
+                {
+                    "node_id": nid,
+                    "estimated_cost": DEFAULT_COST.get("compose", 15),
+                    "model_params": {"prompt": prompt},
+                },
+                f"提交「{title}」合成",
+                "成片节点已在，复用上游片段提交合成，不新建链路",
             ))
             return PlanResult(
                 actions=actions,
-                reply="成片/片段已就绪，可执行超分增强。",
+                reply=f"画布已有成片节点「{title}」，将提交合成。",
                 reply_type="pipeline",
                 pipeline_stage="post_production",
-                next_actions=["超分高清", "剪辑 trim", "换转场重拼"],
+                next_actions=[],
                 requires_confirmation=True,
             )
+        return PlanResult(
+            actions=[PlannedAction(
+                "get_canvas_summary", {}, "成片已就绪",
+                "成片已成功，汇报现状；超分需用户显式要求",
+            )],
+            reply=(
+                f"「{title}」已就绪。"
+                "若要增强画质请说「超分」；若要改某一镜请指出镜头后重跑。"
+            ),
+            reply_type="pipeline",
+            pipeline_stage="post_production",
+            next_actions=["超分成片", "重跑失败的镜头"],
+        )
+
+    # 有就绪片段但无成片节点时不应落到这里；上面已处理 2+ video。
+    # 仅片段就绪的兜底：建议合成
+    if ws.ready_clips and len(ws.ready_clips) >= 2:
+        return PlanResult(
+            actions=[PlannedAction(
+                "get_canvas_summary", {}, "片段已就绪可合成",
+                "视频片段够了但还没有成片节点时，应推进合成而不是超分",
+            )],
+            reply=f"已有 {len(ws.ready_clips)} 路就绪视频片段。请说「直接合成」提交成片。",
+            reply_type="pipeline",
+            pipeline_stage="post_production",
+            next_actions=["直接合成"],
+        )
 
     # 有散落节点但没有短剧流水线 —— 绝不能谎称「各层都有产物」
     if not ws.script_nodes and not ws.shot_nodes:
@@ -736,7 +780,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
             ),
             reply_type="pipeline",
             pipeline_stage=ws.stage,
-            next_actions=["搭建短剧工作流", "生成橘猫恶狼短剧", "梳理画布"],
+            next_actions=[],
         )
 
     return PlanResult(
@@ -752,7 +796,7 @@ def plan_advance_workflow_layer(canvas_context: dict | None, selected_nodes: lis
         ),
         reply_type="pipeline",
         pipeline_stage=ws.stage,
-        next_actions=["推进下一阶段", "重跑 stale 节点", "梳理画布"],
+        next_actions=[],
     )
 
 

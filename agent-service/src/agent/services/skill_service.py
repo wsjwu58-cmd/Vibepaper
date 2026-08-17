@@ -1,38 +1,66 @@
-"""Skill 系统（P1｜F-16/B-28）。"""
+"""Skill 系统：默认 Skill 从 default_skills_seed 入库；运行时只读数据库。"""
 
-import re
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..agent.persona import PAPER_AGENT_INSTRUCTIONS, PAPER_AGENT_SKILL_NAME
+from ..domain.default_skills_seed import DEFAULT_SKILLS_SEED
 from ..models import Skill
 from .session_service import session_service
 
-
-PRESET_SKILLS = [
-    ("短片编剧", "将一句话创意拆解为剧本、角色与分镜", "1. 将用户创意扩写为三幕结构剧本\n2. 拆解关键场景\n3. 为每个场景生成提示词"),
-    ("品牌海报", "生成符合品牌调性的海报方案", "1. 提取品牌关键词\n2. 确定视觉风格\n3. 生成海报构图与文案"),
-    ("概念设计", "角色/场景概念设定图", "1. 明确设计目标\n2. 列出关键视觉元素\n3. 生成多角度设定图"),
-]
-
-# 系统内置：owner_id=0，不对普通用户开放编辑
 SYSTEM_OWNER_ID = 0
 
 
+def skill_to_dict(s: Skill) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "description": s.description,
+        "instructions": s.instructions,
+        "source": s.source,
+        "category": getattr(s, "category", None) or "general",
+        "version": s.version,
+        "enabled": bool(s.enabled),
+        "ownerId": s.owner_id,
+        "createdAt": s.created_at.isoformat() if s.created_at else None,
+        "updatedAt": s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
 class SkillService:
-    def list(self, db: Session, user_id: int, keyword: str | None = None):
-        q = db.query(Skill).filter(
-            or_(Skill.owner_id == user_id, Skill.owner_id == SYSTEM_OWNER_ID),
-            Skill.enabled == True,  # noqa: E712
-        )
+    def list(
+        self,
+        db: Session,
+        user_id: int,
+        keyword: str | None = None,
+        *,
+        category: str | None = None,
+        include_disabled: bool = False,
+        mine_only: bool = False,
+    ):
+        q = db.query(Skill)
+        if mine_only:
+            q = q.filter(Skill.owner_id == user_id, Skill.source != "builtin")
+        else:
+            q = q.filter(or_(Skill.owner_id == user_id, Skill.owner_id == SYSTEM_OWNER_ID))
+        if not include_disabled:
+            q = q.filter(Skill.enabled == True)  # noqa: E712
         if keyword:
-            q = q.filter(or_(Skill.name.ilike(f"%{keyword}%"), Skill.description.ilike(f"%{keyword}%")))
-        return q.order_by(Skill.created_at.desc()).all()
+            like = f"%{keyword}%"
+            q = q.filter(or_(Skill.name.ilike(like), Skill.description.ilike(like)))
+        if category and category not in ("all", "全部", "favorite", "收藏"):
+            if category in ("mine", "我的"):
+                q = q.filter(Skill.owner_id == user_id, Skill.source != "builtin")
+            else:
+                q = q.filter(Skill.category == category)
+        # 内置按名称稳定排序，用户 Skill 靠前
+        return q.order_by(Skill.owner_id.desc(), Skill.name.asc()).all()
 
     def ensure_paper_agent(self, db: Session, user_id: int | None = None) -> Skill:
-        """确保内置 paper-agent-default Skill 存在。"""
         skill = (
             db.query(Skill)
             .filter(Skill.name == PAPER_AGENT_SKILL_NAME, Skill.source == "builtin")
@@ -43,9 +71,10 @@ class SkillService:
                 id=session_service.next_id(),
                 owner_id=SYSTEM_OWNER_ID,
                 name=PAPER_AGENT_SKILL_NAME,
-                description="Paper Agent：梳理画布 / 品牌文案 / 延展方向",
+                description="Paper Agent：梳理画布 / 品牌文案 / 延展方向（性格·原则·规则三层）",
                 instructions=PAPER_AGENT_INSTRUCTIONS,
                 source="builtin",
+                category="general",
                 version=1,
                 enabled=True,
                 created_at=datetime.now(timezone.utc),
@@ -60,30 +89,89 @@ class SkillService:
             db.refresh(skill)
         return skill
 
-    def presets(self, db: Session, user_id: int):
+    def ensure_builtin_skills(self, db: Session) -> int:
+        """将 DEFAULT_SKILLS_SEED 写入 skills 表（幂等 upsert）。不读 md 文件。"""
         self.ensure_paper_agent(db)
-        if db.query(Skill).filter(Skill.owner_id == user_id, Skill.source == "preset").count() == 0:
-            for name, desc, instructions in PRESET_SKILLS:
-                db.add(Skill(id=session_service.next_id(), owner_id=user_id, name=name, description=desc,
-                             instructions=instructions, source="preset", version=1, enabled=True,
-                             created_at=datetime.now(timezone.utc)))
+        upserted = 0
+        for item in DEFAULT_SKILLS_SEED:
+            name = item["name"]
+            description = item.get("description") or name
+            instructions = item.get("instructions") or ""
+            if not instructions.startswith("#"):
+                instructions = f"# {name}\n\n{instructions}"
+            category = item.get("category") or "general"
+            existing = (
+                db.query(Skill)
+                .filter(Skill.name == name, Skill.source == "builtin")
+                .first()
+            )
+            if existing is None:
+                db.add(Skill(
+                    id=session_service.next_id(),
+                    owner_id=SYSTEM_OWNER_ID,
+                    name=name,
+                    description=description,
+                    instructions=instructions,
+                    source="builtin",
+                    category=category,
+                    version=1,
+                    enabled=True,
+                    created_at=datetime.now(timezone.utc),
+                ))
+                upserted += 1
+            else:
+                changed = False
+                if existing.description != description:
+                    existing.description = description
+                    changed = True
+                if existing.instructions != instructions:
+                    existing.instructions = instructions
+                    existing.version += 1
+                    changed = True
+                if getattr(existing, "category", None) != category:
+                    existing.category = category
+                    changed = True
+                if changed:
+                    existing.updated_at = datetime.now(timezone.utc)
+                    upserted += 1
+        if upserted:
             db.commit()
-        return self.list(db, user_id)
+        return upserted
 
-    def create(self, db: Session, user_id: int, name: str, description: str | None,
-               instructions: str, source: str = "manual") -> Skill:
+    def presets(self, db: Session, user_id: int):
+        self.ensure_builtin_skills(db)
+        return self.list(db, user_id, include_disabled=False)
+
+    def create(
+        self,
+        db: Session,
+        user_id: int,
+        name: str,
+        description: str | None,
+        instructions: str,
+        source: str = "manual",
+        category: str = "general",
+    ) -> Skill:
         if not name or not instructions:
             raise ValueError("名称与指令必填")
-        skill = Skill(id=session_service.next_id(), owner_id=user_id, name=name, description=description,
-                      instructions=instructions, source=source, version=1, enabled=True,
-                      created_at=datetime.now(timezone.utc))
+        skill = Skill(
+            id=session_service.next_id(),
+            owner_id=user_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            source=source,
+            category=category or "general",
+            version=1,
+            enabled=True,
+            created_at=datetime.now(timezone.utc),
+        )
         db.add(skill)
         db.commit()
         db.refresh(skill)
         return skill
 
     def from_conversation(self, db: Session, user_id: int, session_id: int, name: str | None) -> Skill:
-        """从当前对话生成 Skill；配置 LLM 时用模型总结，否则回退拼接。"""
         from ..core.config import settings
         from ..models import AgentMessage
 
@@ -156,20 +244,35 @@ class SkillService:
             return skill
         return None
 
-    def update(self, db: Session, skill_id: int, user_id: int, name: str | None = None,
-               description: str | None = None, instructions: str | None = None) -> Skill | None:
+    def update(
+        self,
+        db: Session,
+        skill_id: int,
+        user_id: int,
+        name: str | None = None,
+        description: str | None = None,
+        instructions: str | None = None,
+        enabled: bool | None = None,
+        category: str | None = None,
+    ) -> Skill | None:
         skill = self.get(db, skill_id, user_id)
         if not skill:
             return None
-        if skill.source == "builtin" or skill.owner_id == SYSTEM_OWNER_ID:
-            raise ValueError("内置 Skill 不可编辑")
-        if name:
-            skill.name = name
-        if description is not None:
-            skill.description = description
-        if instructions:
-            skill.instructions = instructions
-            skill.version += 1
+        is_builtin = skill.source == "builtin" or skill.owner_id == SYSTEM_OWNER_ID
+        if is_builtin and (name is not None or description is not None or instructions is not None):
+            raise ValueError("内置 Skill 不可编辑内容")
+        if not is_builtin:
+            if name:
+                skill.name = name
+            if description is not None:
+                skill.description = description
+            if instructions:
+                skill.instructions = instructions
+                skill.version += 1
+            if category is not None:
+                skill.category = category
+        if enabled is not None and not is_builtin:
+            skill.enabled = enabled
         skill.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(skill)
@@ -179,6 +282,8 @@ class SkillService:
         skill = self.get(db, skill_id, user_id)
         if not skill:
             return False
+        if skill.source == "builtin" or skill.owner_id == SYSTEM_OWNER_ID:
+            raise ValueError("内置 Skill 不可删除")
         db.delete(skill)
         db.commit()
         return True

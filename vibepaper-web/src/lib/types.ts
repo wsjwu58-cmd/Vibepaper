@@ -236,8 +236,14 @@ export interface SkillView {
   description?: string;
   instructions: string;
   source: string;
+  category?: string;
   version: number;
+  enabled?: boolean;
+  ownerId?: Id;
+  createdAt?: string;
+  updatedAt?: string;
 }
+
 
 export interface MemoryView {
   id: Id;

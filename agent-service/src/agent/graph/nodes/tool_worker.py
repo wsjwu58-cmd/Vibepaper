@@ -29,8 +29,9 @@ def tool_worker_node(state: AgentState) -> dict:
     canvas_id = state.get("canvas_id")
     canvas_version = int(state.get("canvas_version") or 1)
 
-    results = list(state.get("executed_results") or [])
-    events = list(state.get("events") or [])
+    # operator.add：只返回本 worker 新增结果
+    results: list[dict] = []
+    events: list[dict] = []
 
     tool = TOOLS.get(tool_name)
     db = SessionLocal()

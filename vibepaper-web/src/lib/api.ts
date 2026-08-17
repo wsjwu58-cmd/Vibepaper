@@ -6,6 +6,7 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "/api/v1";
 
 let accessToken: string | null = localStorage.getItem("vp_access");
 let refreshToken: string | null = localStorage.getItem("vp_refresh");
+let refreshInFlight: Promise<boolean> | null = null;
 
 export function setTokens(t: TokenResponse | null) {
   if (t) {
@@ -22,7 +23,7 @@ export function setTokens(t: TokenResponse | null) {
 }
 
 export function getAccessToken() {
-  return accessToken;
+  return accessToken ?? localStorage.getItem("vp_access");
 }
 
 export class ApiError extends Error {
@@ -41,20 +42,64 @@ export class ApiError extends Error {
 }
 
 async function refreshAccess(): Promise<boolean> {
-  if (!refreshToken) return false;
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    if (!refreshToken) return false;
+    try {
+      const res = await fetch(`${API_BASE}/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken }),
+      });
+      if (!res.ok) return false;
+      const data = parseJsonPreserveIds<TokenResponse>(await res.text());
+      setTokens(data);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
   try {
-    const res = await fetch(`${API_BASE}/auth/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refreshToken }),
-    });
-    if (!res.ok) return false;
-    const data = parseJsonPreserveIds<TokenResponse>(await res.text());
-    setTokens(data);
-    return true;
-  } catch {
-    return false;
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
   }
+}
+
+function resolveApiUrl(path: string): string {
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (path.startsWith(API_BASE)) return path;
+  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+/** Authenticated fetch that retries once after refresh on 401. Use for SSE / non-JSON bodies. */
+export async function authedFetch(
+  path: string,
+  options: RequestInit & { idempotencyKey?: string } = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    ...((options.headers as Record<string, string>) ?? {}),
+  };
+  if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+
+  const applyAuth = () => {
+    const token = getAccessToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    else delete headers.Authorization;
+  };
+
+  applyAuth();
+  const doFetch = () => fetch(resolveApiUrl(path), { ...options, headers });
+
+  let res = await doFetch();
+  if (res.status === 401) {
+    const ok = await refreshAccess();
+    if (ok) {
+      applyAuth();
+      res = await doFetch();
+    }
+  }
+  return res;
 }
 
 export async function api<T = unknown>(
@@ -65,17 +110,8 @@ export async function api<T = unknown>(
     "Content-Type": "application/json",
     ...((options.headers as Record<string, string>) ?? {}),
   };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
 
-  const doFetch = async (): Promise<Response> =>
-    fetch(`${API_BASE}${path}`, { ...options, headers });
-
-  let res = await doFetch();
-  if (res.status === 401 && accessToken) {
-    const ok = await refreshAccess();
-    if (ok) res = await doFetch();
-  }
+  const res = await authedFetch(path, { ...options, headers });
 
   if (!res.ok) {
     let code = "INTERNAL_ERROR";
@@ -129,8 +165,7 @@ export function assetUrl(url?: string): string | undefined {
 }
 
 export function apiUrl(path: string): string {
-  if (path.startsWith("http")) return path;
-  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  return resolveApiUrl(path);
 }
 
 export async function uploadAsset(
@@ -144,9 +179,7 @@ export async function uploadAsset(
   if (type) fd.append("type", type);
   if (canvasId != null) fd.append("canvasId", String(canvasId));
   if (nodeId != null) fd.append("nodeId", String(nodeId));
-  const headers: Record<string, string> = {};
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  const res = await fetch(`${API_BASE}/assets`, { method: "POST", headers, body: fd });
+  const res = await authedFetch("/assets", { method: "POST", body: fd });
   if (!res.ok) throw new ApiError(res.status, "UPLOAD_FAILED", "上传失败");
   return parseJsonPreserveIds(await res.text());
 }

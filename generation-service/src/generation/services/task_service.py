@@ -113,10 +113,11 @@ class TaskService:
             task.attempts += 1
             db.commit()
             publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "running"})
+            self.notify_canvas_node(task, "running")
 
             from .model_resolve import resolve_model_config
 
-            # model_type 可能是具体名（deepseek-v4-pro）或 modality 别名（text）
+            # model_type 可能是具体名（agnes-2.5-flash）或 modality 别名（text）
             model = resolve_model_config(db, task.model_type)
             provider_name = model.provider if model else "mock"
             modality = model.model_type if model else task.model_type
@@ -186,6 +187,7 @@ class TaskService:
                 db.commit()
                 publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "succeeded",
                                         "actualCost": task.actual_cost, "outputCount": len(outputs)})
+                self.notify_canvas_node(task, "succeeded", outputs)
                 self.notify_billing(task_id, "settle", {
                     "taskId": task_id, "actualCost": task.actual_cost, "modelType": task.model_type})
                 self.notify_identity_progress(task.user_id)
@@ -206,6 +208,7 @@ class TaskService:
                 db.commit()
                 publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "failed",
                                         "errorCode": task.error_code, "errorMessage": task.error_message})
+                self.notify_canvas_node(task, "failed")
                 self.notify_billing(task_id, "fail", {
                     "taskId": task_id, "errorCode": task.error_code})
                 self.notify_analytics("task_generate_fail", {
@@ -229,6 +232,7 @@ class TaskService:
                 publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "failed",
                                         "errorCode": task.error_code, "errorMessage": task.error_message})
                 self.notify_billing(task_id, "fail", {"taskId": task_id, "errorCode": task.error_code})
+                self.notify_canvas_node(task, "failed")
         finally:
             db.close()
 
@@ -243,6 +247,7 @@ class TaskService:
             task.updated_at = datetime.now(timezone.utc)
             db.commit()
             publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "cancelled"})
+            self.notify_canvas_node(task, "cancelled")
             self.notify_analytics("task_generate_cancel", {
                 "task_id": task_id, "from_status": "queued" if task.status == "cancelled" else "running",
                 "points_unfrozen": task.estimated_cost})
@@ -259,6 +264,7 @@ class TaskService:
         task.updated_at = datetime.now(timezone.utc)
         db.commit()
         publish_event(task_id, {"type": "task_status", "taskId": task_id, "status": "expired"})
+        self.notify_canvas_node(task, "expired")
         return self.to_dict(task)
 
     def list_tasks(self, db: Session, user_id: int, keyword: Optional[str] = None, model: Optional[str] = None,
@@ -327,6 +333,74 @@ class TaskService:
                 for o in outs
             ]
         return data
+
+    def notify_canvas_node(self, task: GenerationTask, status: str, outputs: list | None = None) -> None:
+        """生成终态回写画布 status/execStatus，避免 UI 已成功、Agent 摘要仍是 running。"""
+        canvas_id = task.canvas_id
+        node_id = task.node_id
+        user_id = task.user_id
+        if not canvas_id or not node_id or not user_id:
+            return
+        node_status = "succeeded" if status in ("succeeded", "settlement_error") else status
+        body: dict = {"status": node_status, "execStatus": node_status, "stale": False}
+        if node_status == "succeeded" and outputs:
+            first = outputs[0]
+            url = getattr(first, "url", None) if not isinstance(first, dict) else first.get("url")
+            meta = getattr(first, "meta", None) if not isinstance(first, dict) else first.get("meta")
+            if not isinstance(meta, dict):
+                meta = {}
+            text = str(meta.get("text") or meta.get("content") or "").strip() or None
+            output: dict = {}
+            if isinstance(url, str) and url.strip():
+                output["url"] = url.strip()
+            if text:
+                output.update({"text": text, "content": text})
+            if output:
+                body["output"] = output
+        try:
+            httpx.put(
+                f"{settings.canvas_base_url}/api/v1/canvases/{canvas_id}/nodes/{node_id}",
+                headers={
+                    "X-User-Id": str(user_id),
+                    "X-User-Role": "user",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=5,
+                trust_env=False,
+            )
+        except Exception as e:
+            print(f"[warn] notify canvas failed: {e}")
+        # 终态事件唤醒 Agent（主路径）；clock 仅作长延迟兜底
+        if status in ("succeeded", "failed", "cancelled", "expired", "settlement_error"):
+            self.notify_agent_resume(task, status)
+
+    def notify_agent_resume(self, task: GenerationTask, status: str) -> None:
+        """HTTP 回调 agent-service：generation_terminal → resume。"""
+        if status not in ("succeeded", "failed", "cancelled", "expired", "settlement_error"):
+            return
+        base = (settings.agent_base_url or "").rstrip("/")
+        if not base:
+            return
+        try:
+            httpx.post(
+                f"{base}/internal/agent/resume",
+                json={
+                    "type": "generation_terminal",
+                    "task_id": task.id,
+                    "taskId": task.id,
+                    "node_id": task.node_id,
+                    "canvas_id": task.canvas_id,
+                    "user_id": task.user_id,
+                    "status": status,
+                    "error_code": task.error_code,
+                    "model_type": task.model_type,
+                },
+                timeout=8,
+                trust_env=False,
+            )
+        except Exception as e:
+            print(f"[warn] notify agent resume failed: {e}")
 
     def notify_billing(self, task_id, action, payload):
         try:

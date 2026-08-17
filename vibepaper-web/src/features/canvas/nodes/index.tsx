@@ -6,11 +6,11 @@ import { api, uploadAsset } from '@/lib/api'
 import { fetchAuthedBlob, resolveMediaUrl, useAuthedMediaUrl } from '@/lib/media'
 import { sid } from '@/lib/ids'
 import type { GenerationTask, Id, ModelInfo, NodePayload, PageResult } from '@/lib/types'
-import { useCanvasStore, type FlowNode } from '../canvasStore'
+import { useCanvasStore, nodeMediaUrl, type FlowNode } from '../canvasStore'
 import { NODE_COLORS, statusBadge } from './NodeShell'
 import { NodeEditorDialog, NodeFloatingToolbar } from './NodeEditorPanel'
 import { SplitNodeLayout } from './SplitNodeLayout'
-import { submitNodeTask } from './taskActions'
+import { persistNodeExec, submitNodeTask, syncExecFields } from './taskActions'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
 import { DirectorNodeView } from '../director'
 
@@ -30,18 +30,16 @@ function useNodeTasks(nodeId: string) {
     refetchInterval: (query) => {
       const items = query.state.data
       if (items?.some((t) => ['queued', 'running'].includes(t.status))) return 2000
-      const nodeStatus = useCanvasStore.getState().nodes.find((n) => sid(n.id) === sid(nodeId))?.data.node.status
-      if (nodeStatus && ['queued', 'running'].includes(nodeStatus)) return 2000
+      const node = useCanvasStore.getState().nodes.find((n) => sid(n.id) === sid(nodeId))?.data.node
+      if (node?.status && ['queued', 'running'].includes(node.status)) return 2000
+      if (node?.execStatus && ['queued', 'running'].includes(node.execStatus)) return 2000
       return false
     },
   })
 
   useEffect(() => {
     const items = data.filter((t) => sid(t.nodeId) === sid(nodeId))
-    const latest =
-      items.find((t) => t.status === 'running' || t.status === 'queued') ??
-      items.find((t) => t.status === 'succeeded') ??
-      items[0]
+    const latest = pickLatestTask(items)
     if (!latest) return
     const node = useCanvasStore.getState().nodes.find((n) => sid(n.id) === sid(nodeId))
     if (!node) return
@@ -50,7 +48,14 @@ function useNodeTasks(nodeId: string) {
       const url = resolveMediaUrl(out?.url, out?.meta as Record<string, unknown>)
       const text = out?.meta?.text != null ? String(out.meta.text) : undefined
       const patch: Record<string, unknown> = {}
-      if (['queued', 'running'].includes(node.data.node.status)) patch.status = latest.status
+      const exec = String(node.data.node.execStatus || '')
+      if (
+        node.data.node.status !== latest.status ||
+        exec !== latest.status ||
+        ['queued', 'running', 'ready'].includes(exec)
+      ) {
+        Object.assign(patch, syncExecFields(latest.status))
+      }
       if (latest.status === 'succeeded' && (url || text)) {
         patch.params = {
           ...node.data.node.params,
@@ -58,7 +63,10 @@ function useNodeTasks(nodeId: string) {
           ...(text ? { lastOutputText: text } : {}),
         }
       }
-      if (Object.keys(patch).length) useCanvasStore.getState().updateNodePayload(nodeId, patch as never)
+      if (Object.keys(patch).length) {
+        useCanvasStore.getState().updateNodePayload(nodeId, patch as never)
+        void persistNodeExec(nodeId, patch as never)
+      }
     }
   }, [data, nodeId])
 
@@ -77,13 +85,7 @@ function useNodeTasks(nodeId: string) {
   )
   const latest = useMemo(() => {
     const items = data.filter((t) => sid(t.nodeId) === sid(nodeId))
-    return (
-      (currentId ? items.find((t) => sid(t.taskId) === sid(currentId)) : undefined) ??
-      items.find((t) => t.status === 'running' || t.status === 'queued') ??
-      items.find((t) => t.status === 'succeeded') ??
-      items[0] ??
-      null
-    )
+    return pickLatestTask(items, currentId)
   }, [currentId, data, nodeId])
 
   return { tasks: data, latest }
@@ -236,7 +238,7 @@ function TaskHistoryBar({
   const setCurrent = (taskId: Id) => {
     useCanvasStore.getState().updateNodePayload(nodeId, {
       currentOutputId: taskId,
-      status: 'succeeded',
+      ...syncExecFields('succeeded'),
       params: {
         ...(useCanvasStore.getState().nodes.find((n) => sid(n.id) === sid(nodeId))?.data.node.params ?? {}),
       },
@@ -248,7 +250,8 @@ function TaskHistoryBar({
     if (!latest) return
     try {
       await api(`/tasks/${latest.taskId}/cancel`, { method: 'POST' })
-      useCanvasStore.getState().updateNodePayload(nodeId, { status: 'cancelled' })
+      useCanvasStore.getState().updateNodePayload(nodeId, syncExecFields('cancelled'))
+      void persistNodeExec(nodeId, syncExecFields('cancelled'))
       toastSuccess('任务已取消')
       window.dispatchEvent(new CustomEvent('vp-task-updated', { detail: { nodeId: sid(nodeId), taskId: sid(latest.taskId) } }))
     } catch (e) {
@@ -260,7 +263,11 @@ function TaskHistoryBar({
     if (!latest) return
     try {
       await api(`/tasks/${latest.taskId}/retry`, { method: 'POST' })
-      useCanvasStore.getState().updateNodePayload(nodeId, { status: 'queued', currentOutputId: latest.taskId })
+      useCanvasStore.getState().updateNodePayload(nodeId, {
+        ...syncExecFields('queued'),
+        currentOutputId: latest.taskId,
+      })
+      void persistNodeExec(nodeId, { ...syncExecFields('queued'), currentOutputId: latest.taskId })
       toastSuccess('已重新提交')
       window.dispatchEvent(new CustomEvent('vp-task-updated', { detail: { nodeId: sid(nodeId), taskId: sid(latest.taskId) } }))
     } catch {
@@ -356,13 +363,38 @@ async function uploadNodeOutput(nodeId: Id, node: NodePayload, file: File) {
   }
 }
 
+function pickLatestTask(items: GenerationTask[], currentId?: Id): GenerationTask | null {
+  if (currentId) {
+    const pinned = items.find((t) => sid(t.taskId) === sid(currentId))
+    if (pinned) return pinned
+  }
+  const inflight = items.find((t) => t.status === 'running' || t.status === 'queued')
+  const succeeded = items.find((t) => t.status === 'succeeded' && (t.outputs?.length ?? 0) > 0)
+    ?? items.find((t) => t.status === 'succeeded')
+  if (inflight && succeeded) {
+    const inflightAt = Date.parse(inflight.createdAt || '') || 0
+    const doneAt = Date.parse(succeeded.createdAt || '') || 0
+    // 更早的僵尸 running 不应盖住已经成功的产物
+    return inflightAt > doneAt ? inflight : succeeded
+  }
+  return inflight ?? succeeded ?? items[0] ?? null
+}
+
+function nodeHasPreview(node: NodePayload, latest: GenerationTask | null): boolean {
+  if ((latest?.outputs?.length ?? 0) > 0) return true
+  const p = node.params || {}
+  return Boolean(p.url || p.lastOutputUrl || p.thumbnailUrl || p.lastOutputText)
+}
+
 function nodeBusy(node: NodePayload, latest: GenerationTask | null) {
-  return (
+  const inFlight =
     node.status === 'queued' ||
     node.status === 'running' ||
     latest?.status === 'queued' ||
     latest?.status === 'running'
-  )
+  if (!inFlight) return false
+  // 已有画面时不要整图盖「生成中」
+  return !nodeHasPreview(node, latest)
 }
 
 function SplitNodeEditor({
@@ -448,7 +480,7 @@ const ImageNodeView = memo(function ImageNodeView(props: NodeProps<FlowNode>) {
   const nodeId = sid(props.id)
   const node = useNodeData(nodeId)
   const { tasks, latest } = useNodeTasks(nodeId)
-  const assetFallback = (node?.params.url as string) || (node?.params.thumbnailUrl as string) || undefined
+  const assetFallback = nodeMediaUrl(node) || undefined
   const outputs = latest?.outputs ?? []
   const mediaUrl =
     resolveMediaUrl(outputs[0]?.url, outputs[0]?.meta as Record<string, unknown>) ?? assetFallback
@@ -487,7 +519,7 @@ const ImageNodeView = memo(function ImageNodeView(props: NodeProps<FlowNode>) {
             {outputs.length > 0 ? (
               <OutputGrid outputs={outputs} large={props.selected} />
             ) : mediaUrl ? (
-              <MediaContent url={assetFallback} large={props.selected} outputType="image" />
+              <MediaContent url={mediaUrl} large={props.selected} outputType="image" />
             ) : (
               <ImageIconPlaceholder compact={!props.selected} />
             )}
@@ -504,7 +536,7 @@ const VideoNodeView = memo(function VideoNodeView(props: NodeProps<FlowNode>) {
   const nodeId = sid(props.id)
   const node = useNodeData(nodeId)
   const { tasks, latest } = useNodeTasks(nodeId)
-  const assetFallback = (node?.params.url as string) || undefined
+  const assetFallback = nodeMediaUrl(node) || undefined
   const out = latest?.outputs?.[0]
   const mediaUrl = resolveMediaUrl(out?.url, out?.meta as Record<string, unknown>) ?? assetFallback
   const remote = typeof out?.meta?.remoteUrl === 'string' ? String(out.meta.remoteUrl) : undefined
@@ -563,7 +595,7 @@ const AudioNodeView = memo(function AudioNodeView(props: NodeProps<FlowNode>) {
   const node = useNodeData(nodeId)
   const { tasks, latest } = useNodeTasks(nodeId)
   const out = latest?.outputs?.[0]
-  const assetFallback = (node?.params.url as string) || (node?.params.referenceUrl as string) || undefined
+  const assetFallback = nodeMediaUrl(node) || (node?.params.referenceUrl as string) || undefined
   const mediaUrl = resolveMediaUrl(out?.url, out?.meta as Record<string, unknown>) ?? assetFallback
   if (!node) return null
   const busy = nodeBusy(node, latest)

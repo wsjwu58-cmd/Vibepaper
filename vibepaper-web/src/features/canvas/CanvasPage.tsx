@@ -19,7 +19,7 @@ import '@xyflow/react/dist/style.css'
 import { api, ApiError, uploadAsset } from '@/lib/api'
 import { isValidEntityId, sid } from '@/lib/ids'
 import type { AssetView, CanvasDetail, ModelInfo, NodePayload } from '@/lib/types'
-import { buildFlow, toPayloads, toEdgePayloads, useCanvasStore, type FlowNode } from './canvasStore'
+import { buildFlow, mergeHydrateFlow, toPayloads, toEdgePayloads, useCanvasStore, type FlowNode } from './canvasStore'
 import { nodeTypes } from './nodes'
 import { CanvasTopBar } from './CanvasTopBar'
 import { CanvasToolbar } from './CanvasToolbar'
@@ -103,11 +103,19 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   })
 
   useEffect(() => {
+    let t: number | null = null
     const onAgentExecuted = () => {
-      void refetch()
+      if (t != null) window.clearTimeout(t)
+      t = window.setTimeout(() => {
+        t = null
+        void refetch()
+      }, 1600)
     }
     window.addEventListener('vp-agent-executed', onAgentExecuted)
-    return () => window.removeEventListener('vp-agent-executed', onAgentExecuted)
+    return () => {
+      window.removeEventListener('vp-agent-executed', onAgentExecuted)
+      if (t != null) window.clearTimeout(t)
+    }
   }, [refetch])
 
   useEffect(() => {
@@ -115,7 +123,8 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
     skipNextSave.current = true
     setCanvas(detail)
     const flow = buildFlow(detail, selectNode)
-    setNodes(flow.nodes.map((n) => ({ ...n, data: { ...n.data, models: models ?? [] } })))
+    const merged = mergeHydrateFlow(flow.nodes, useCanvasStore.getState().nodes)
+    setNodes(merged.map((n) => ({ ...n, data: { ...n.data, models: models ?? [] } })))
     setEdges(flow.edges)
     setGroups(detail.groups)
     setStacks(detail.stacks)

@@ -9,10 +9,12 @@ from ...agent.planner import (
     classify_intent,
     detect_pipeline_stage,
     llm_plan_structured,
+    llm_suggest_next_actions,
     plan,
 )
 from ...core.config import settings
 from ...domain.pipeline import plan_advance_pipeline, plan_reregenerate_stale
+from ...domain.precedence import classify_stance, filter_actions_for_stance
 from ..state import AgentState, PlannedActionDict
 
 
@@ -36,13 +38,21 @@ def planner_node(state: AgentState) -> dict:
     ctx = state.get("canvas_context") or {}
     selected = state.get("selected_nodes") or []
     intent = classify_intent(content)
+    stance = classify_stance(content, intent)
 
-    # P1 专用路径：优先于 LLM
-    if intent == "advance_pipeline":
+    # 讨论态：不走编排/推进等写路径，避免「问方案却开始搭节点」
+    if stance == "discuss" and intent in (
+        "advance_pipeline", "reregenerate_stale", "orchestrate_workflow",
+        "create", "generate", "delete", "update", "connect", "layout", "model",
+    ):
+        intent = "general"
+
+    # P1 专用路径：优先于 LLM（仅指令态）
+    if stance == "instruct" and intent == "advance_pipeline":
         result = plan_advance_pipeline(ctx, selected)
-    elif intent == "reregenerate_stale":
+    elif stance == "instruct" and intent == "reregenerate_stale":
         result = plan_reregenerate_stale(ctx)
-    elif intent == "orchestrate_workflow":
+    elif stance == "instruct" and intent == "orchestrate_workflow":
         from ...domain.workflow_orchestrator import plan_workflow_orchestration
         result = plan_workflow_orchestration(content, ctx, selected)
     elif settings.llm_api_key:
@@ -59,8 +69,11 @@ def planner_node(state: AgentState) -> dict:
         )
     else:
         # Paper 意图无 LLM 时明确降级
-        if intent in ("summarize", "copy", "directions"):
-            result = _paper_fallback_reply(intent, ctx)
+        if intent in ("summarize", "copy", "directions") or stance == "discuss":
+            result = _paper_fallback_reply(
+                intent if intent in ("summarize", "copy", "directions") else "directions",
+                ctx,
+            )
         else:
             actions = plan(content, ctx, selected)
             result = PlanResult(
@@ -70,6 +83,23 @@ def planner_node(state: AgentState) -> dict:
                 pipeline_stage=detect_pipeline_stage(ctx),
                 llm_available=False,
             )
+
+    # 讨论态：剥掉写/执行动作，只保留只读
+    if stance == "discuss":
+        result.actions = filter_actions_for_stance(result.actions, "discuss")
+
+    # 规则路径或 LLM 未给出建议时：有 Key 则让模型按上下文自写，禁止场景词表硬编码
+    if not result.next_actions and settings.llm_api_key:
+        result.next_actions = llm_suggest_next_actions(
+            content=content,
+            reply=result.reply or "",
+            pipeline_stage=result.pipeline_stage or detect_pipeline_stage(ctx),
+            actions=result.actions,
+            canvas_context=ctx,
+            api_key=settings.llm_api_key,
+            base_url=settings.normalized_llm_base_url(),
+            model=settings.llm_model,
+        )
 
     planned: list[PlannedActionDict] = []
     for a in result.actions:
@@ -90,13 +120,16 @@ def planner_node(state: AgentState) -> dict:
         })
 
     planned = _filter_replan_actions(state, planned)
+    if stance == "discuss":
+        planned = filter_actions_for_stance(planned, "discuss")
 
-    events = list(state.get("events") or [])
+    events: list[dict] = []
     note = state.get("reflection_note")
     if note:
         events.append({"type": "reflection", "note": note})
     if result.thinking:
         events.append({"type": "thinking", "content": result.thinking})
+    events.append({"type": "stance", "stance": stance, "intent": intent})
     for a in planned:
         events.append({
             "type": "plan_step",
@@ -107,6 +140,7 @@ def planner_node(state: AgentState) -> dict:
 
     return {
         "planned_actions": planned,
+        "intent_type": intent,
         "reply": result.reply,
         "reply_type": result.reply_type,
         "pipeline_stage": result.pipeline_stage,

@@ -262,9 +262,12 @@ class SessionService:
         return cleaned
 
     def confirm(self, db: Session, session_id: int, user_id: int, action_id: int, token: str,
-                accept: bool) -> dict:
+                accept: bool, confirmed_action: dict | None = None) -> dict:
         from ..graph.app import resume_agent_confirm
-        return resume_agent_confirm(session_id, user_id, action_id, accept)
+        return resume_agent_confirm(
+            session_id, user_id, action_id, accept,
+            confirmed_action=confirmed_action if isinstance(confirmed_action, dict) else None,
+        )
 
     def build_reply(self, actions, executed, pending_tokens) -> str:
         lines = [f"- {a.summary}" for a in actions]

@@ -1,10 +1,11 @@
 export interface ExecutionStep {
   id: string
-  kind: 'plan' | 'result' | 'reasoning'
+  /** plan=待执行 · result=工具完成 · reasoning=推理 · speech=对用户说话 */
+  kind: 'plan' | 'result' | 'reasoning' | 'speech'
   tool?: string
   label: string
   summary: string
-  /** 这步为什么这么做（创作者语言，展示在计划步骤下） */
+  /** 展开工具行时展示的细节（创作者语言） */
   reasoning?: string
   ok?: boolean
   detail?: string
@@ -28,30 +29,54 @@ export interface AgentChatMsg {
     pipelineStage?: string
     suggestions?: AgentSuggestion[]
     nextActions?: string[]
+    loadedSkills?: string[]
     executionSteps?: ExecutionStep[]
     taskStatus?: { taskId?: string; status?: string; nodeId?: string; modelType?: string }
     requiresConfirmation?: boolean
   }
 }
 
-export const TOOL_LABELS: Record<string, string> = {
-  get_canvas_summary: '读取画布',
-  get_selected_nodes: '读取选中节点',
-  list_models: '查询模型',
-  search_assets: '查询资源',
-  create_nodes: '编辑画布',
-  connect_nodes: '编辑画布',
-  layout_nodes: '整理画布',
-  update_node_config: '修改节点',
-  delete_nodes: '删除节点',
-  change_model: '切换模型',
-  replace_output: '覆盖输出',
-  submit_generation: '提交生成',
-  check_task_status: '查询任务',
-  update_memory: '更新记忆',
-  clock: '安排轮询',
-  load_skill: '加载 Skill',
-}
+  /** 与官网 Vivi 工具行文案对齐；P0 控制平面按能力归类 */
+  export const TOOL_LABELS: Record<string, string> = {
+    get_canvas_summary: '读取资源',
+    get_selected_nodes: '读取资源',
+    get_all_nodes: '读取资源',
+    list_models: '查询模型',
+    search_assets: '查询资源',
+    create_nodes: '编辑画布',
+    connect_nodes: '编辑画布',
+    layout_nodes: '编辑画布',
+    update_node_config: '编辑画布',
+    delete_nodes: '编辑画布',
+    change_model: '切换模型',
+    replace_output: '覆盖输出',
+    submit_generation: '提交生成',
+    check_task_status: '查询任务',
+    update_memory: '更新记忆',
+    clock: '安排跟进',
+    load_skill: '加载技能',
+    extract_frames: '抽帧',
+    trim_clip: '裁剪片段',
+    upscale: '超分',
+    compose_final: '合成成片',
+    capture_3d_scene: '导演台捕获',
+    // P0 能力门面（若 SSE 直接透出 operation）
+    read: '读取资源',
+    query: '查询资源',
+    create: '编辑画布',
+    patch: '编辑画布',
+    connect: '编辑画布',
+    disconnect: '编辑画布',
+    delete: '编辑画布',
+    layout: '编辑画布',
+    submit: '提交生成',
+    extract_clip: '裁剪片段',
+    extract_frame: '抽帧',
+    compose: '合成成片',
+    sign: '素材认证',
+    retry: '重试制品',
+    capture: '导演台捕获',
+  }
 
 export function toolLabel(tool?: string): string {
   if (!tool) return '操作'
@@ -79,6 +104,15 @@ export function stepFromThinking(content: string, idx: number): ExecutionStep {
     id: `reason-${idx}`,
     kind: 'reasoning',
     label: '推理过程',
+    summary: content.trim(),
+  }
+}
+
+export function stepFromSpeech(content: string, idx: number): ExecutionStep {
+  return {
+    id: `speech-${idx}`,
+    kind: 'speech',
+    label: '回复',
     summary: content.trim(),
   }
 }

@@ -1,5 +1,21 @@
 import type { AgentChatMsg, ExecutionStep } from './agentTypes'
-import { stepFromPlan, stepFromResult, toolLabel } from './agentTypes'
+import { stepFromPlan, stepFromResult, stepFromSpeech, stepFromThinking, toolLabel } from './agentTypes'
+
+function stripEmbeddedReactJson(text: string): string {
+  const s = text.trim()
+  if (!s) return ''
+  const re = /\{[\s\n\r]*"(?:thinking|decision|_actions|actions|ask_question)"/
+  const m = re.exec(s)
+  if (!m || m.index == null) {
+    if (s.includes('"_actions"') && s.includes('"decision"')) {
+      const idx = s.indexOf('{')
+      return idx > 0 ? s.slice(0, idx).trim() : ''
+    }
+    return s
+  }
+  if (m.index > 0) return s.slice(0, m.index).trim()
+  return ''
+}
 
 function appendExecutionStep(steps: ExecutionStep[], step: ExecutionStep): ExecutionStep[] {
   const key = `${step.kind ?? ''}|${step.tool ?? ''}|${step.summary ?? ''}`
@@ -7,6 +23,47 @@ function appendExecutionStep(steps: ExecutionStep[], step: ExecutionStep): Execu
     return steps
   }
   return [...steps, step]
+}
+
+/** 同一拍推理：落在时间线末尾的 reasoning 上累加；若中间已插入工具/对白则新开一段。 */
+function upsertReasoning(steps: ExecutionStep[], content: string): ExecutionStep[] {
+  const next = [...steps]
+  const last = next[next.length - 1]
+  if (last?.kind === 'reasoning') {
+    const prev = stripEmbeddedReactJson(last.summary || '')
+    const nextSummary =
+      content.startsWith(prev) || prev.startsWith(content)
+        ? content.length >= prev.length
+          ? content
+          : prev
+        : prev
+          ? `${prev}\n\n${content}`
+          : content
+    next[next.length - 1] = {
+      ...last,
+      summary: stripEmbeddedReactJson(nextSummary),
+    }
+    return next
+  }
+  return [...next, stepFromThinking(content, Date.now())]
+}
+
+function upsertSpeech(steps: ExecutionStep[], content: string): ExecutionStep[] {
+  const trimmed = content.trim()
+  if (!trimmed) return steps
+  const next = [...steps]
+  const last = next[next.length - 1]
+  if (last?.kind === 'speech') {
+    // 流式覆盖同段；若是全新更长段落且不以旧文开头，则新开一段（中途对白）
+    if (trimmed === last.summary) return next
+    if (trimmed.startsWith(last.summary) || last.summary.startsWith(trimmed)) {
+      next[next.length - 1] = { ...last, summary: trimmed }
+      return next
+    }
+  }
+  // 避免与已有完全相同的 speech 重复
+  if (next.some((s) => s.kind === 'speech' && s.summary === trimmed)) return next
+  return [...next, stepFromSpeech(trimmed, Date.now())]
 }
 
 export function isChatVisibleMessage(m: AgentChatMsg): boolean {
@@ -36,9 +93,43 @@ export function applyAgentEvent(
   ev: Record<string, unknown>,
   turnId: string | null,
 ): AgentChatMsg[] {
-  // thinking / reflection：不渲染成「推理过程」长独白；理由走 plan_step.reasoning
   if (ev.type === 'thinking' || ev.type === 'reflection') {
-    return messages
+    const content = stripEmbeddedReactJson(String(ev.content ?? ev.note ?? '').trim())
+    if (!content) return messages
+    return patchLastAssistant(messages, (m) => ({
+      ...m,
+      meta: {
+        ...m.meta,
+        executionSteps: upsertReasoning(m.meta?.executionSteps ?? [], content),
+      },
+    }))
+  }
+
+  if (ev.type === 'skill_loaded') {
+    const name = String(
+      ev.skill || (Array.isArray(ev.keys) ? (ev.keys as string[]).join('、') : '') || 'Skill',
+    )
+    if (!name || name === 'paper-agent-default') return messages
+    return patchLastAssistant(messages, (m) => {
+      const skills = [...(m.meta?.loadedSkills ?? [])]
+      if (!skills.includes(name)) skills.push(name)
+      return {
+        ...m,
+        meta: {
+          ...m.meta,
+          loadedSkills: skills,
+          executionSteps: appendExecutionStep(m.meta?.executionSteps ?? [], {
+            id: `skill-${name}`,
+            kind: 'result',
+            tool: 'load_skill',
+            label: '加载技能',
+            summary: name,
+            ok: true,
+            reasoning: `加载 ${name}`,
+          }),
+        },
+      }
+    })
   }
 
   if (ev.type === 'plan_step') {
@@ -57,11 +148,26 @@ export function applyAgentEvent(
     }))
   }
 
+  if (ev.type === 'speech' && ev.content) {
+    const content = String(ev.content)
+    return patchLastAssistant(messages, (m) => ({
+      ...m,
+      meta: {
+        ...m.meta,
+        executionSteps: upsertSpeech(m.meta?.executionSteps ?? [], content),
+      },
+    }))
+  }
+
   if (ev.type === 'inline_confirm' && ev.content) {
     const line = String(ev.content)
     return patchLastAssistant(messages, (m) => ({
       ...m,
       content: m.content?.trim() ? `${m.content.trim()}\n${line}` : line,
+      meta: {
+        ...m.meta,
+        executionSteps: upsertSpeech(m.meta?.executionSteps ?? [], line),
+      },
     }))
   }
 
@@ -69,15 +175,31 @@ export function applyAgentEvent(
     const tool = ev.tool as string | undefined
     const ok = !!ev.ok
     const data = (ev.data || {}) as Record<string, unknown>
+    const submitAck =
+      tool === 'submit_generation' &&
+      ok &&
+      !data.skipped &&
+      Boolean(data.ack || data.task_id || data.taskId)
     const detail = ok
       ? tool === 'submit_generation'
-        ? '已受理，排队生成中'
+        ? data.skipped
+          ? String(data.note ?? '已跳过（节点已有成品）')
+          : submitAck
+            ? '已受理，排队生成中'
+            : String(data.note ?? data.error ?? '未实际提交')
         : undefined
       : String(data.error ?? '')
+    const label = toolLabel(tool)
     const step = stepFromResult(
       tool,
-      ok,
-      `${toolLabel(tool)} ${ok ? '完成' : '失败'}`,
+      ok && (tool !== 'submit_generation' || submitAck || !!data.skipped),
+      ok
+        ? submitAck || tool !== 'submit_generation'
+          ? data.skipped && tool === 'submit_generation'
+            ? `${label}（已跳过）`
+            : label
+          : `${label}（未提交）`
+        : `${label}失败`,
       detail,
     )
     return patchLastAssistant(messages, (m) => ({
@@ -92,23 +214,71 @@ export function applyAgentEvent(
   if (ev.type === 'assistant_message' && ev.content) {
     const content = String(ev.content)
     const last = messages[messages.length - 1]
-    if (last?.role === 'assistant' && last.content === content) return messages
+    if (last?.role === 'assistant' && last.content === content && !ev.executionSteps) return messages
+    const spam = /任务已提交|后台生成中|依赖就绪的下游/
+    if (
+      last?.role === 'assistant' &&
+      spam.test(content) &&
+      spam.test(String(last.content || ''))
+    ) {
+      return messages
+    }
+    const streaming = ev.streaming === true
+    const silentContent = ev.silentContent === true
     const steps = (ev.executionSteps as ExecutionStep[] | undefined) ?? []
+    const patchMeta = (m: AgentChatMsg): AgentChatMsg['meta'] => {
+      let executionSteps = (() => {
+        const incoming = !streaming && steps.length ? steps : steps.length ? steps : m.meta?.executionSteps
+        if (!incoming?.length) return m.meta?.executionSteps ?? []
+        const prevSkills = (m.meta?.executionSteps ?? []).filter((s) => s.tool === 'load_skill')
+        const prevSpeech = (m.meta?.executionSteps ?? []).filter((s) => s.kind === 'speech')
+        let merged = [...incoming]
+        if (prevSkills.length && !merged.some((s) => s.tool === 'load_skill')) {
+          merged = [...prevSkills, ...merged]
+        }
+        // 收尾 executionSteps 若缺 speech，保留时间线里已有的对白段
+        if (prevSpeech.length && !merged.some((s) => s.kind === 'speech')) {
+          const tools = merged.filter((s) => s.kind !== 'speech')
+          merged = [...prevSpeech, ...tools]
+        }
+        return merged
+      })()
+      if (!silentContent && content.trim()) {
+        executionSteps = upsertSpeech(executionSteps, content)
+      }
+      return {
+        ...m.meta,
+        replyType: (ev.replyType as string | undefined) ?? m.meta?.replyType,
+        pipelineStage: (ev.pipelineStage as string | undefined) ?? m.meta?.pipelineStage,
+        suggestions: streaming
+          ? m.meta?.suggestions
+          : ((ev.suggestions as AgentChatMsg['meta'] extends { suggestions?: infer S } ? S : never) ??
+            m.meta?.suggestions),
+        nextActions: streaming
+          ? m.meta?.nextActions
+          : ((ev.nextActions as string[]) ?? m.meta?.nextActions),
+        loadedSkills: streaming
+          ? m.meta?.loadedSkills
+          : (Array.isArray(ev.loadedSkills)
+              ? (ev.loadedSkills as unknown[])
+                  .map((x) =>
+                    typeof x === 'string'
+                      ? x
+                      : String((x as { name?: string; key?: string })?.name || (x as { key?: string })?.key || ''),
+                  )
+                  .filter(Boolean)
+              : m.meta?.loadedSkills),
+        executionSteps,
+      }
+    }
     const existing = messages.find((m) => m.id === turnId)
     if (existing) {
       return messages.map((m) =>
         m.id === turnId
           ? {
               ...m,
-              content,
-              meta: {
-                ...m.meta,
-                replyType: ev.replyType as string | undefined,
-                pipelineStage: ev.pipelineStage as string | undefined,
-                suggestions: ev.suggestions as AgentChatMsg['meta'] extends infer M ? M extends { suggestions?: infer S } ? S : never : never,
-                nextActions: (ev.nextActions as string[]) ?? m.meta?.nextActions,
-                executionSteps: steps.length ? steps : m.meta?.executionSteps,
-              },
+              content: silentContent && m.content?.trim() ? m.content : content,
+              meta: patchMeta(m),
             }
           : m,
       )
@@ -120,13 +290,13 @@ export function applyAgentEvent(
         role: 'assistant',
         type: 'text',
         content,
-        meta: {
-          replyType: ev.replyType as string | undefined,
-          pipelineStage: ev.pipelineStage as string | undefined,
-          suggestions: ev.suggestions as AgentChatMsg['meta'] extends { suggestions?: infer S } ? S : never,
-          nextActions: ev.nextActions as string[] | undefined,
-          executionSteps: steps,
-        },
+        meta: patchMeta({
+          id: turnId ?? Date.now(),
+          role: 'assistant',
+          type: 'text',
+          content,
+          meta: {},
+        }),
       },
     ]
   }
@@ -166,7 +336,7 @@ export function applyAgentEvent(
               status: st,
               nodeId: data.node_id as string | undefined,
             },
-            nextActions: st === 'succeeded' ? ['图生视频', '换风格重做'] : ['换模型重做', '修改 Prompt'],
+            executionSteps: [stepFromSpeech(content, Date.now())],
           },
         },
       ]

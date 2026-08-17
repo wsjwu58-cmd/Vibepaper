@@ -137,13 +137,73 @@ export function buildFlow(
   return { nodes, edges }
 }
 
+const TERMINAL_STATUS = new Set(['succeeded', 'failed', 'cancelled', 'expired'])
+
+const TERMINAL_OK = new Set(['succeeded', 'success', 'ready', 'failed', 'cancelled', 'expired'])
+
+export function nodeMediaUrl(n: NodePayload | undefined): string {
+  if (!n) return ''
+  const p = n.params || {}
+  const out = n.output
+  const fromOut = out && typeof out.url === 'string' ? out.url : ''
+  return String(p.lastOutputUrl || p.url || p.thumbnailUrl || p.output_url || fromOut || '')
+}
+
+export function mergeHydrateNode(server: NodePayload, local?: NodePayload): NodePayload {
+  if (!local) return server
+  const sUrl = nodeMediaUrl(server)
+  const lUrl = nodeMediaUrl(local)
+  const params = { ...(server.params || {}) }
+  if (!sUrl && lUrl) {
+    params.url = (local.params?.url as string) || lUrl
+    params.lastOutputUrl = (local.params?.lastOutputUrl as string) || lUrl
+    if (local.params?.thumbnailUrl) params.thumbnailUrl = local.params.thumbnailUrl
+    if (local.params?.output_url) params.output_url = local.params.output_url
+  }
+  const sText = String(server.params?.lastOutputText || '')
+  const lText = String(local.params?.lastOutputText || '')
+  if (!sText && lText) params.lastOutputText = lText
+  const output =
+    server.output && Object.keys(server.output).length > 0 ? server.output : (local.output ?? server.output)
+  const localExec = String(local.execStatus || local.status || '').toLowerCase()
+  const serverExec = String(server.execStatus || server.status || '').toLowerCase()
+  let execStatus = server.execStatus
+  let status = server.status
+  if (TERMINAL_OK.has(localExec) && ['idle', 'stale', ''].includes(serverExec)) {
+    execStatus = local.execStatus || local.status
+    status = local.status || local.execStatus || status
+  }
+  return { ...server, params, output: output ?? server.output, execStatus, status }
+}
+
+export function mergeHydrateFlow(server: FlowNode[], local: FlowNode[]): FlowNode[] {
+  const byId = new Map(local.map((n) => [sid(n.id), n]))
+  return server.map((n) => {
+    const loc = byId.get(sid(n.id))
+    if (!loc) return n
+    return { ...n, data: { ...n.data, node: mergeHydrateNode(n.data.node, loc.data.node) } }
+  })
+}
+
 export function toPayloads(nodes: FlowNode[]): NodePayload[] {
-  return nodes.map((n) => ({
-    ...n.data.node,
-    id: sid(n.id),
-    x: n.position.x,
-    y: n.position.y,
-  }))
+  return nodes.map((n) => {
+    const node = { ...n.data.node, id: sid(n.id), x: n.position.x, y: n.position.y }
+    const status = String(node.status || '')
+    let execStatus = String(node.execStatus || '')
+    if (execStatus === 'ready') execStatus = 'succeeded'
+    if (TERMINAL_STATUS.has(status) && (!execStatus || ['queued', 'running', 'ready'].includes(execStatus))) {
+      execStatus = status
+    }
+    const url = nodeMediaUrl(node)
+    const params = { ...(node.params || {}) }
+    if (url) {
+      if (!params.url) params.url = url
+      if (!params.lastOutputUrl) params.lastOutputUrl = url
+    }
+    const output =
+      node.output && Object.keys(node.output).length > 0 ? node.output : url ? { ...node.output, url } : node.output
+    return { ...node, params, output, execStatus: execStatus || node.execStatus }
+  })
 }
 
 export function toEdgePayloads(edges: Edge[]): EdgePayload[] {

@@ -16,6 +16,7 @@ _PATCHES = [
     "ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS last_merged_at TIMESTAMPTZ",
     "ALTER TABLE session_fragments ADD COLUMN IF NOT EXISTS fragment_type VARCHAR(32) DEFAULT 'worldview'",
     "ALTER TABLE session_fragments ADD COLUMN IF NOT EXISTS canvas_id BIGINT",
+    "ALTER TABLE skills ADD COLUMN IF NOT EXISTS category VARCHAR(32) DEFAULT 'general'",
 ]
 
 

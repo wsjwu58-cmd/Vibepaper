@@ -10,7 +10,14 @@ from generation.services.model_resolve import resolve_model_config
 
 def test_resolve_exact_name():
     db = MagicMock()
-    model = SimpleNamespace(name="deepseek-v4-pro", model_type="text", provider="deepseek", enabled=True)
+    model = SimpleNamespace(name="agnes-2.5-flash", model_type="text", provider="agnes-text", enabled=True)
+    db.query.return_value.filter.return_value.first.return_value = model
+    assert resolve_model_config(db, "agnes-2.5-flash") is model
+
+
+def test_resolve_legacy_text_alias():
+    db = MagicMock()
+    model = SimpleNamespace(name="agnes-2.5-flash", model_type="text", provider="agnes-text", enabled=True)
     db.query.return_value.filter.return_value.first.return_value = model
     assert resolve_model_config(db, "deepseek-v4-pro") is model
 
@@ -18,7 +25,7 @@ def test_resolve_exact_name():
 def test_resolve_text_alias_prefers_llm_model():
     db = MagicMock()
     preferred = SimpleNamespace(
-        name="deepseek-v4-pro", model_type="text", provider="deepseek", enabled=True,
+        name="agnes-2.5-flash", model_type="text", provider="agnes-text", enabled=True,
     )
 
     # first().first() for exact miss, then preferred hit
@@ -36,3 +43,12 @@ def test_resolve_text_alias_prefers_llm_model():
 
     got = resolve_model_config(db, "text")
     assert got is preferred
+
+
+def test_agnes_text_provider_not_image():
+    from generation.providers.providers import get_provider
+
+    assert get_provider("agnes-text", "text").name == "openai-text"
+    assert get_provider("agnes-2.5-flash", "text").name == "openai-text"
+    assert get_provider("agnes-text", "agnes-2.5-flash").name == "openai-text"
+    assert get_provider("agnes-image", "image").name == "agnes-image"

@@ -408,7 +408,10 @@ public class GraphService {
             if (node.getOutput() != null && !node.getOutput().isBlank()) {
                 Object out = new com.fasterxml.jackson.databind.ObjectMapper().readValue(node.getOutput(), Object.class);
                 if (out instanceof Map<?, ?> m && m.get("url") != null) {
-                    params.put("output_url", m.get("url"));
+                    Object url = m.get("url");
+                    params.put("output_url", url);
+                    params.putIfAbsent("lastOutputUrl", url);
+                    params.putIfAbsent("url", url);
                 } else {
                     params.put("output", out);
                 }

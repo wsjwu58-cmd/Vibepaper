@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ import httpx
 import redis
 
 from ..core.config import settings
+from ..domain.skill_catalog import SKILL_CATALOG
 
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True, protocol=2)
 
@@ -35,9 +37,16 @@ def _require_canvas_id(canvas_id) -> int | dict:
 
 
 COMPOSITE_SKILL_INSTRUCTIONS = {
-    "video-generation": (
-        "视频生成规则：先确认分镜/关键帧就绪；查模型时长限制；"
-        "create clip 节点后 submit_generation；用 clock 延时查状态。"
+    key: (
+        f"{skill.description}\n触发：{skill.trigger_semantics}\n"
+        f"骨架：{' → '.join(skill.workflow_skeleton)}\n{skill.instructions}"
+    )
+    for key, skill in SKILL_CATALOG.items()
+}
+COMPOSITE_SKILL_INSTRUCTIONS.update({
+    "video-generation": COMPOSITE_SKILL_INSTRUCTIONS.get(
+        "vertical-short-drama",
+        "视频生成：先确认分镜/关键帧就绪；create clip 后 submit。",
     ),
     "3d-stage-composition": (
         "3D导演台构图：先引导用户搭机位与角色站位，再导出静态构图参考作为关键帧。"
@@ -45,10 +54,7 @@ COMPOSITE_SKILL_INSTRUCTIONS = {
     "post-production": (
         "后期流水线顺序：超分 → 裁剪 → 按依赖序拼接成片。不要跳步。"
     ),
-    "character-consistency": (
-        "角色一致性：维护形象/服装/表情表；下游镜头引用角色卡作为 input 依赖。"
-    ),
-}
+})
 
 
 def headers_for(user_id: int, role: str = "user", enterprise_id: str = "") -> dict:
@@ -197,21 +203,20 @@ def _create_nodes(canvas_id: int, user_id: int, nodes: list[dict] | None = None,
     if not nodes:
         return {"error": "create_nodes 缺少 nodes（或 type/config）参数", "error_code": "INVALID_INPUT"}
     from ..domain.prompt_builder import ensure_node_prompt
-    from ..domain.video_task import DEFAULT_VIDEO_MODEL
+    from ..domain.workflow_rails import IMAGE_PREF_MODEL, backfill_video_node_params
     user_hint = str(ctx.get("user_content") or ctx.get("content") or "")
     nodes = [ensure_node_prompt(n, user_hint) for n in nodes]
     created = []
     for n in nodes:
         params = dict(n.get("params") or n.get("config") or {})
         node_type = n.get("type") or "text"
-        # 视频默认 Seedance 1.0 Pro；非用户点名 1.5/2.0 时纠偏
+        # 轨道回填：视频/图片偏好参数由工作流写入，不靠模型编造
         if node_type == "video":
-            import re as _re
-            m = str(params.get("model") or "")
-            user_wants_newer = bool(_re.search(r"1\.5|1-5|2\.0|2-0", user_hint))
-            if (not m) or (_re.search(r"1-5-pro|1\.5|2-0|2\.0", m) and not user_wants_newer):
-                params["model"] = DEFAULT_VIDEO_MODEL
-                n["params"] = params
+            params = backfill_video_node_params(params, user_content=user_hint)
+            n["params"] = params
+        elif node_type == "image":
+            params.setdefault("model", IMAGE_PREF_MODEL)
+            n["params"] = params
         prompt = n.get("prompt") or params.get("prompt")
         model_ref = n.get("modelRef") or n.get("model_ref") or params.get("model")
         body = {
@@ -330,7 +335,15 @@ def _layout_nodes(canvas_id: int, user_id: int, layout: str = "auto", **ctx) -> 
     return {"layout": layout, "mode": "dependency", "updatedNodes": len(updates)}
 
 
-def _update_node_config(canvas_id: int, user_id: int, node_id: int, params: dict, **ctx) -> dict:
+def _update_node_config(canvas_id: int, user_id: int, node_id: int | None = None, params: dict | None = None, **ctx) -> dict:
+    if node_id is None:
+        node_id = ctx.get("nodeId")
+    if node_id is None:
+        return {"error": "node_id required", "error_code": "INVALID_INPUT"}
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return {"error": "params must be object", "error_code": "INVALID_INPUT"}
     body: dict = {"params": params}
     if params.get("prompt"):
         body["prompt"] = params["prompt"]
@@ -391,11 +404,21 @@ def _node_media_url(node: dict) -> str | None:
     params = node.get("params") or {}
     out = node.get("output")
     if isinstance(out, dict):
-        for k in ("url", "lastOutputUrl", "imageUrl", "videoUrl"):
+        for k in ("url", "lastOutputUrl", "imageUrl", "videoUrl", "thumbnailUrl"):
             v = out.get(k)
             if isinstance(v, str) and v.strip().startswith(("http", "/")):
                 return v.strip()
-    for k in ("lastOutputUrl", "url", "thumbnailUrl", "referenceUrl", "output_url"):
+        # 兼容 outputs 数组形态
+        outputs = out.get("outputs") or out.get("files") or []
+        if isinstance(outputs, list):
+            for item in outputs:
+                if isinstance(item, dict):
+                    v = item.get("url") or item.get("fileUrl")
+                    if isinstance(v, str) and v.strip().startswith(("http", "/")):
+                        return v.strip()
+                elif isinstance(item, str) and item.strip().startswith(("http", "/")):
+                    return item.strip()
+    for k in ("lastOutputUrl", "url", "thumbnailUrl", "referenceUrl", "output_url", "imageUrl"):
         v = params.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
@@ -420,10 +443,71 @@ def _node_text_output(node: dict) -> str | None:
     return None
 
 
-def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dict:
-    """从 input 连线收集上游产物：文本→referenceTexts，图/视频→referenceUrls。
+_REF_MEDIA_KEYS = (
+    "referenceUrls", "referenceImages", "referenceTexts",
+    "imageUrl", "firstFrameUrl", "lastFrameUrl", "image", "image_url",
+    "referenceUrl", "sourceUrl",
+)
 
-    形象/构图靠连线喂入，不靠把上游全文粘进 Prompt。
+
+def _merge_reference_params(base: dict, refs: dict) -> dict:
+    """把上游参考字段合并进提交参数（不覆盖已有非空值；列表去重追加）。"""
+    params = dict(base or {})
+    for key, val in (refs or {}).items():
+        if key not in params or not params.get(key):
+            params[key] = val
+        elif key in ("referenceUrls", "referenceImages", "referenceTexts") and isinstance(val, list):
+            merged = list(params.get(key) or [])
+            for item in val:
+                if item not in merged:
+                    merged.append(item)
+            params[key] = merged
+    return params
+
+
+def _preserve_reference_fields(old: dict, new: dict) -> dict:
+    """轨道参数重算后，把参考图/文本字段从旧 params 拷回。"""
+    out = dict(new or {})
+    for key in _REF_MEDIA_KEYS:
+        if key in out and out.get(key):
+            continue
+        val = (old or {}).get(key)
+        if val:
+            out[key] = val
+    return out
+
+
+def _reinforce_prompt_with_reference(params: dict, model_type: str) -> dict:
+    """有参考图时，提示词强调忠实于首帧/参考，避免文生漂移。"""
+    out = dict(params or {})
+    has_image = bool(
+        out.get("firstFrameUrl")
+        or out.get("imageUrl")
+        or out.get("image")
+        or (isinstance(out.get("referenceImages"), list) and out.get("referenceImages"))
+        or (isinstance(out.get("referenceUrls"), list) and out.get("referenceUrls"))
+    )
+    if not has_image:
+        return out
+    prompt = str(out.get("prompt") or "").strip()
+    mt = str(model_type or "").lower()
+    fidelity = ""
+    if mt in ("video",) or str(out.get("model") or "").startswith(("agnes-video", "doubao-seedance", "seedance")):
+        fidelity = "严格保持与参考首帧同一主体、构图、服装与色调；只描述运动与镜头变化，勿重新创造形象。"
+    elif mt in ("image",) or str(out.get("model") or "").startswith(("agnes-image", "doubao-seedream", "seedream")):
+        fidelity = "严格参考输入图片的主体、构图与风格，仅按提示词做有限调整，勿整体重绘成另一张图。"
+    if not fidelity:
+        return out
+    if fidelity[:8] in prompt:
+        return out
+    out["prompt"] = f"{prompt}\n{fidelity}".strip() if prompt else fidelity
+    return out
+
+
+def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dict:
+    """从连线收集上游产物：文本→referenceTexts，图/视频→referenceUrls。
+
+    input / reference 两类连线都会喂参考（形象/构图靠连线，不靠把上游全文粘进 Prompt）。
     """
     try:
         r = httpx.get(
@@ -444,8 +528,9 @@ def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dic
     ref_texts: list[str] = []
     first_image: str | None = None
     for e in edges:
-        dep = e.get("dependencyType") or e.get("dependency_type") or "reference"
-        if dep != "input":
+        dep = str(e.get("dependencyType") or e.get("dependency_type") or "reference").lower()
+        # control 不喂内容；input/reference 都可作为参考素材
+        if dep not in ("input", "reference", ""):
             continue
         tgt = e.get("targetNodeId") or e.get("target")
         src = e.get("sourceNodeId") or e.get("source")
@@ -464,6 +549,9 @@ def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dic
                 ref_urls.append(url)
                 if ntype == "image" and not first_image:
                     first_image = url
+                # 仅视频上游且尚无图片首帧时，也可作参考（非首帧优先）
+                if ntype == "video" and not first_image:
+                    pass
         elif ntype == "text":
             text = _node_text_output(src_node)
             if text:
@@ -505,17 +593,7 @@ def _submit_generation(canvas_id: int, user_id: int, node_id: int, model_type: s
         return {"error": "缺少节点 ID，无法提交生成", "error_code": "INVALID_INPUT"}
 
     # 注入上游 reference：形象靠连线，Prompt 只写本次动作
-    params = dict(model_params or {})
-    refs = _collect_input_references(canvas_id, user_id, coerced)
-    for key, val in refs.items():
-        if key not in params or not params.get(key):
-            params[key] = val
-        elif key in ("referenceUrls", "referenceImages", "referenceTexts") and isinstance(val, list):
-            merged = list(params.get(key) or [])
-            for item in val:
-                if item not in merged:
-                    merged.append(item)
-            params[key] = merged
+    params = _merge_reference_params(dict(model_params or {}), _collect_input_references(canvas_id, user_id, coerced))
 
     from ..domain.prompt_builder import refine_prompt_on_submit
     from ..domain.model_defaults import resolve_submit_model
@@ -529,6 +607,29 @@ def _submit_generation(canvas_id: int, user_id: int, node_id: int, model_type: s
              "creativeType": params.get("creativeType")},
             None,
         )
+
+    workflow_notes: list[str] = []
+    # 视频：工作流裁定参数合法性与兼容换模（模型只负责 prompt 内容）
+    if str(model_type or "").lower() == "video" or str(params.get("model") or "").startswith(
+        ("doubao-seedance", "agnes-video", "seedance", "wan-2"),
+    ):
+        from ..domain.video_task import build_video_task_params
+
+        before_rails = dict(params)
+        task = build_video_task_params(
+            content=str(ctx.get("user_content") or ctx.get("content") or ""),
+            prompt=str(params.get("prompt") or ""),
+            model_name=params.get("model"),
+            node_params=params,
+            extra={k: params[k] for k in _REF_MEDIA_KEYS if params.get(k)},
+        )
+        # 关键：轨道回填会重建 model_params，必须把参考图/首帧拷回去，否则图生视频变文生视频
+        params = _preserve_reference_fields(before_rails, task["model_params"])
+        workflow_notes = list(task.get("workflow_notes") or [])
+        if task.get("estimated_cost"):
+            estimated_cost = max(1, int(task["estimated_cost"]))
+
+    params = _reinforce_prompt_with_reference(params, model_type)
 
     # 禁止把 modality「text」原样交给 generation（会掉进 mock-text）
     node_model_ref = params.get("modelRef") or ctx.get("modelRef") or ctx.get("model")
@@ -572,16 +673,22 @@ def _submit_generation(canvas_id: int, user_id: int, node_id: int, model_type: s
         return {"error": r.text[:300]}
     data = r.json()
     task_id = data.get("taskId") or data.get("id")
-    return {
+    result = {
         "ack": True,
         "task_id": task_id,
         "taskId": task_id,
         "status": data.get("status") or "queued",
-        "estimatedCost": body["estimatedCost"],
-        "model_type": resolved_model,
-        "node_id": coerced,
-        **data,
+        "model": resolved_model,
+        "model_params": params,
     }
+    if workflow_notes:
+        result["workflow_notes"] = workflow_notes
+    result["estimatedCost"] = body["estimatedCost"]
+    result["model_type"] = resolved_model
+    result["node_id"] = coerced
+    result.update({k: v for k, v in data.items() if k not in result})
+    _mark_node_generating(canvas_id, user_id, coerced, str(result.get("status") or "queued"))
+    return result
 
 
 def _update_memory(user_id: int, scope: str, content: str, canvas_id: int | None = None,
@@ -617,29 +724,87 @@ def _clock(user_id: int, delay: int, note: dict | None = None, callback: str = "
     }
 
 
-def _load_skill(skill_key: str, user_id: int | None = None, **ctx) -> dict:
-    instructions = COMPOSITE_SKILL_INSTRUCTIONS.get(skill_key)
+def _load_skill(skill_key: str | None = None, user_id: int | None = None, **ctx) -> dict:
+    """按需加载 Skill 创作规则（catalog → 路由名 → DB）。"""
+    from ..domain.skill_catalog import get_skill, resolve_route_keys, skill_instructions_bundle
+
+    if not skill_key:
+        skill_key = (
+            ctx.get("skillKey")
+            or ctx.get("key")
+            or ctx.get("skill")
+            or ctx.get("name")
+            or ctx.get("skill_name")
+        )
+    key = (skill_key or "").strip()
+    if not key:
+        return {"error": "skill_key required", "error_code": "INVALID_INPUT"}
+
+    # 组合路由名 → 多 Skill 合并
+    route_keys = resolve_route_keys(key)
+    if len(route_keys) > 1 or (route_keys and route_keys[0] != key and key not in SKILL_CATALOG):
+        bundle = skill_instructions_bundle(route_keys)
+        if bundle:
+            return {
+                "skill_key": key,
+                "loaded_keys": route_keys,
+                "instructions": bundle,
+                "name": key,
+            }
+
+    skill = get_skill(key) or get_skill(route_keys[0] if route_keys else "")
+    if skill:
+        text = (
+            f"{skill.description}\n触发：{skill.trigger_semantics}\n"
+            f"骨架：{' → '.join(skill.workflow_skeleton)}\n{skill.instructions}"
+        )
+        return {
+            "skill_key": skill.key,
+            "loaded_keys": [skill.key],
+            "instructions": text,
+            "name": skill.name,
+            "skeleton": list(skill.workflow_skeleton),
+        }
+
+    instructions = COMPOSITE_SKILL_INSTRUCTIONS.get(key)
     if not instructions and user_id:
-        # 尝试从 DB 按名加载
         try:
             from ..core.db import SessionLocal
             from ..models import Skill
             db = SessionLocal()
             try:
-                skill = (
+                row = (
                     db.query(Skill)
-                    .filter(Skill.owner_id == user_id, Skill.name == skill_key, Skill.enabled == True)  # noqa: E712
+                    .filter(Skill.owner_id == user_id, Skill.name == key, Skill.enabled == True)  # noqa: E712
                     .first()
                 )
-                if skill:
-                    instructions = skill.instructions
+                if row:
+                    instructions = row.instructions
             finally:
                 db.close()
         except Exception:
             pass
     if not instructions:
-        return {"error": f"skill not found: {skill_key}"}
-    return {"instructions": instructions, "skill_key": skill_key}
+        return {"error": f"skill not found: {key}", "error_code": "INVALID_INPUT"}
+    return {"skill_key": key, "loaded_keys": [key], "instructions": instructions, "name": key}
+
+
+def _mark_node_generating(canvas_id: int | None, user_id: int, node_id: int, status: str = "queued") -> None:
+    """提交后立刻把节点打成 queued，避免画布仍是 idle/stale 被下游调度反复重提。"""
+    if not canvas_id or not node_id:
+        return
+    st = status if status in ("queued", "running") else "queued"
+    try:
+        httpx.put(
+            f"{settings.canvas_base_url}/api/v1/canvases/{canvas_id}/nodes/{node_id}",
+            headers=headers_for(user_id),
+            json={"status": st, "execStatus": st, "stale": False},
+            timeout=8,
+            trust_env=False,
+        )
+    except Exception:
+        logger = logging.getLogger("agent.tools")
+        logger.debug("mark node generating failed node=%s", node_id)
 
 
 def _check_task_status(user_id: int, task_id: str | int | None = None, node_id: int | None = None,
@@ -865,6 +1030,60 @@ def classify_risk(tool_name: str, params: dict, canvas: dict | None = None) -> t
             return "high", "model_switch"
         return "low", None
     return tool.risk_level, None
+
+
+def normalize_tool_params(tool_name: str, params: dict | None) -> dict:
+    """把 LLM 常见的扁平/驼峰参数收成工具真实签名所需形态。"""
+    raw = dict(params or {})
+    if tool_name == "load_skill":
+        key = (
+            raw.get("skill_key")
+            or raw.get("skillKey")
+            or raw.get("key")
+            or raw.get("skill")
+            or raw.get("name")
+            or raw.get("skill_name")
+            or raw.get("skillName")
+        )
+        if isinstance(key, dict):
+            key = key.get("key") or key.get("skill_key") or key.get("name")
+        out = {"skill_key": str(key or "").strip()}
+        # 透传其余字段到 **ctx
+        for k, v in raw.items():
+            if k not in out and k not in {"skillKey", "skill", "name", "skill_name", "skillName", "key"}:
+                out[k] = v
+        return out
+
+    if tool_name == "update_node_config":
+        node_id = raw.get("node_id") if raw.get("node_id") is not None else raw.get("nodeId")
+        nested = raw.get("params")
+        if not isinstance(nested, dict):
+            nested = {}
+        # 扁平 prompt/model 提升进 params
+        for k in ("prompt", "title", "model", "modelRef", "content", "text"):
+            if k in raw and k not in nested and raw[k] is not None:
+                nested[k] = raw[k]
+        # 若整包只有 config/patch
+        for alt in ("config", "patch", "updates", "nodeParams"):
+            extra = raw.get(alt)
+            if isinstance(extra, dict):
+                nested = {**extra, **nested}
+        if not nested and isinstance(raw.get("body"), dict):
+            nested = dict(raw["body"])
+        out = {"node_id": node_id, "params": nested}
+        for k, v in raw.items():
+            if k in {
+                "node_id", "nodeId", "params", "prompt", "title", "model", "modelRef",
+                "content", "text", "config", "patch", "updates", "nodeParams", "body",
+            }:
+                continue
+            out[k] = v
+        return out
+
+    if tool_name in ("change_model", "replace_output", "submit_generation"):
+        if raw.get("node_id") is None and raw.get("nodeId") is not None:
+            raw = {**raw, "node_id": raw.get("nodeId")}
+    return raw
 
 
 def create_confirm_token(user_id: int, canvas_id: int, canvas_version: int, action_summary: str) -> str:

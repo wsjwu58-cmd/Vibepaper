@@ -7,6 +7,7 @@ import { resolveMediaUrl, useAuthedMediaUrl } from '@/lib/media'
 import type { ModelInfo } from '@/lib/types'
 import { useCanvasStore, type FlowNode } from '../canvasStore'
 import { statusBadge } from '../nodes/NodeShell'
+import { syncExecFields } from '../nodes/taskActions'
 import { DirectorStageEditor } from './DirectorStageEditor'
 import {
   DEFAULT_CAMERA,
@@ -94,7 +95,7 @@ export const DirectorNodeView = memo(function DirectorNodeView(props: NodeProps<
     }
     useCanvasStore.getState().updateNodePayload(nodeId, {
       params,
-      status: latestUrl ? 'succeeded' : current?.status ?? node.status,
+      ...(latestUrl ? syncExecFields('succeeded') : { status: current?.status ?? node.status }),
     })
   }
 

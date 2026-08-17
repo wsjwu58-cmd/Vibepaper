@@ -115,6 +115,11 @@ public class CanvasService {
             throw ApiException.conflict(ErrorCode.VERSION_CONFLICT, "画布已在其他会话更新，请刷新");
         }
 
+        List<CanvasNode> previousNodes = nodeMapper.selectList(
+                new LambdaQueryWrapper<CanvasNode>().eq(CanvasNode::getCanvasId, canvasId));
+        Map<Long, CanvasNode> previousById = previousNodes.stream()
+                .collect(Collectors.toMap(CanvasNode::getId, n -> n, (a, b) -> a));
+
         // 全量替换节点/连线/编组/堆叠
         nodeMapper.delete(new LambdaQueryWrapper<CanvasNode>().eq(CanvasNode::getCanvasId, canvasId));
         edgeMapper.delete(new LambdaQueryWrapper<CanvasEdge>().eq(CanvasEdge::getCanvasId, canvasId));
@@ -142,9 +147,10 @@ public class CanvasService {
                 node.setModelRef(n.modelRef());
                 node.setPrompt(n.prompt());
                 node.setExecStatus(n.execStatus() == null ? "idle" : n.execStatus());
-                if (n.output() != null) {
+                if (n.output() != null && !n.output().isEmpty()) {
                     node.setOutput(writeJson(n.output()));
                 }
+                applyPreservedGeneration(node, n, previousById.get(n.id()));
                 node.setCurrentOutputId(n.currentOutputId());
                 node.setGroupId(n.groupId());
                 node.setStackId(n.stackId());
@@ -533,10 +539,58 @@ public class CanvasService {
             m.put("stale", Boolean.TRUE.equals(n.getStale()));
             m.put("modelRef", n.getModelRef());
             m.put("execStatus", n.getExecStatus() == null ? "idle" : n.getExecStatus());
+            boolean hasOutput = false;
+            try {
+                if (n.getOutput() != null && !n.getOutput().isBlank()) {
+                    Map<String, Object> out = objectMapper.readValue(n.getOutput(), new TypeReference<>() {
+                    });
+                    Object outUrl = out.get("url");
+                    Object outText = out.get("text");
+                    if (outText == null) outText = out.get("content");
+                    if (outUrl != null && !outUrl.toString().isBlank()) {
+                        m.put("outputUrl", outUrl.toString());
+                        hasOutput = true;
+                    }
+                    if (outText != null && !outText.toString().isBlank()) {
+                        String t = outText.toString().trim();
+                        m.put("lastOutputText", t.length() > 240 ? t.substring(0, 240) : t);
+                        hasOutput = true;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
             if (n.getPrompt() != null) {
                 String p = n.getPrompt().trim();
                 m.put("prompt", p.length() > 48 ? p.substring(0, 48) : p);
             }
+            try {
+                Map<String, Object> p = n.getParams() == null ? Map.of()
+                        : objectMapper.readValue(n.getParams(), new TypeReference<>() {
+                });
+                Object title = p.get("title");
+                if (title != null && !title.toString().isBlank()) {
+                    m.put("title", title.toString());
+                }
+                Object body = p.get("lastOutputText");
+                if (body == null) body = p.get("content");
+                if (body == null) body = p.get("text");
+                if (body != null) {
+                    String t = body.toString().trim();
+                    if (!t.isEmpty()) {
+                        m.put("lastOutputText", t.length() > 240 ? t.substring(0, 240) : t);
+                        hasOutput = true;
+                    }
+                }
+                Object url = p.get("lastOutputUrl");
+                if (url == null) url = p.get("url");
+                if (url == null) url = p.get("thumbnailUrl");
+                if (url != null && !url.toString().isBlank()) {
+                    m.putIfAbsent("outputUrl", url.toString());
+                    hasOutput = true;
+                }
+            } catch (Exception ignored) {
+            }
+            m.put("hasOutput", hasOutput);
             return m;
         }).toList();
 
@@ -637,9 +691,10 @@ public class CanvasService {
             CanvasNode target = nodeMapper.selectById(e.getTargetNodeId());
             if (target != null && !Boolean.TRUE.equals(target.getStale())) {
                 target.setStale(true);
-                target.setExecStatus("stale");
-                if (!"queued".equals(target.getStatus()) && !"running".equals(target.getStatus())) {
-                    // 保留任务态；其余标记 stale 语义
+                String exec = target.getExecStatus() == null ? "" : target.getExecStatus().toLowerCase();
+                // 只打 stale 标记；禁止覆盖 queued/running/已成功，否则调度会把成品当可再提交
+                if (!List.of("queued", "running", "succeeded", "success", "ready").contains(exec)) {
+                    target.setExecStatus("stale");
                 }
                 target.setUpdatedAt(OffsetDateTime.now());
                 nodeMapper.updateById(target);
@@ -670,6 +725,52 @@ public class CanvasService {
             return major >= 1;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /** 整表保存不得抹掉生成产物：前端 payload 常缺 output，或把 succeeded 写成 idle。 */
+    private void applyPreservedGeneration(CanvasNode node, CanvasDtos.NodePayload incoming, CanvasNode previous) {
+        if (previous == null) {
+            return;
+        }
+        if ((incoming.output() == null || incoming.output().isEmpty())
+                && previous.getOutput() != null && !previous.getOutput().isBlank()) {
+            node.setOutput(previous.getOutput());
+        }
+        node.setParams(writeJson(mergeParamsKeepMedia(node.getParams(), previous.getParams())));
+        String incomingExec = node.getExecStatus() == null ? "" : node.getExecStatus().toLowerCase();
+        String prevExec = previous.getExecStatus() == null ? "" : previous.getExecStatus().toLowerCase();
+        if (List.of("succeeded", "success", "ready").contains(prevExec)
+                && List.of("idle", "stale", "").contains(incomingExec)) {
+            node.setExecStatus(previous.getExecStatus());
+            String st = node.getStatus() == null ? "" : node.getStatus().toLowerCase();
+            if (List.of("idle", "stale", "").contains(st)) {
+                node.setStatus(previous.getStatus() != null ? previous.getStatus() : previous.getExecStatus());
+            }
+        }
+    }
+
+    private Map<String, Object> mergeParamsKeepMedia(String incomingJson, String previousJson) {
+        Map<String, Object> incoming = readMap(incomingJson);
+        Map<String, Object> previous = readMap(previousJson);
+        for (String key : List.of("url", "lastOutputUrl", "thumbnailUrl", "output_url", "lastOutputText")) {
+            Object cur = incoming.get(key);
+            if ((cur == null || cur.toString().isBlank()) && previous.get(key) != null) {
+                incoming.put(key, previous.get(key));
+            }
+        }
+        return incoming;
+    }
+
+    private Map<String, Object> readMap(String json) {
+        if (json == null || json.isBlank()) {
+            return new HashMap<>();
+        }
+        try {
+            return objectMapper.readValue(json, new TypeReference<>() {
+            });
+        } catch (Exception e) {
+            return new HashMap<>();
         }
     }
 

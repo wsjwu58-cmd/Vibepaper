@@ -75,19 +75,24 @@ def _write_result_message(db, session_id: int, tool: str, ok: bool, data: dict):
 
 
 def _call_tool(tool, canvas_id, user_id, params: dict, *, extra: dict | None = None) -> dict:
-    kwargs = dict(params)
+    kwargs = dict(params or {})
     kwargs.pop("canvas_id", None)
     if extra:
         kwargs.update(extra)
     try:
         return tool.fn(canvas_id=canvas_id, user_id=user_id, **kwargs)
     except TypeError:
-        return tool.fn(user_id=user_id, canvas_id=canvas_id, **kwargs)
+        # 部分工具不收 canvas_id
+        try:
+            return tool.fn(user_id=user_id, **kwargs)
+        except TypeError:
+            return tool.fn(user_id=user_id, canvas_id=canvas_id, **kwargs)
 
 
 def executor_node(state: AgentState) -> dict:
-    results = list(state.get("executed_results") or [])
-    events = list(state.get("events") or [])
+    # executed_results / events 均为 operator.add：只收集本节点新增项
+    results: list[dict] = []
+    events: list[dict] = []
     user_id = state["user_id"]
     canvas_id = state.get("canvas_id")
     canvas_version = int(state.get("canvas_version") or 1)
@@ -102,12 +107,19 @@ def executor_node(state: AgentState) -> dict:
             action_id = int(action.get("action_id") or _next_id())
             summary = action.get("summary") or tool_name
 
-            # create_nodes 后：解析占位符并注入新建节点 ID
-            if tool_name in EXEC_TOOLS or tool_name == "submit_generation":
+            from ...tools.registry import normalize_tool_params
+            params = normalize_tool_params(tool_name, params)
+
+            # create / update / submit：解析占位符并注入新建节点 ID
+            if tool_name in EXEC_TOOLS or tool_name in (
+                "submit_generation", "update_node_config", "change_model", "replace_output",
+            ):
                 raw_nid = params.get("node_id") or params.get("nodeId")
                 resolved = _resolve_node_ref(raw_nid, created_node_ids, last_created_node_id)
                 if resolved:
                     params["node_id"] = resolved
+                elif raw_nid is None and last_created_node_id and tool_name == "update_node_config":
+                    params["node_id"] = last_created_node_id
             if tool_name == "connect_nodes":
                 edges = list(params.get("edges") or [])
                 fixed = []
@@ -303,6 +315,8 @@ def executor_node(state: AgentState) -> dict:
                 _write_result_message(db, state["session_id"], tool_name, ok, data)
                 db.commit()
                 entry = {"tool": tool_name, "ok": ok, "data": data, "summary": summary}
+                if state.get("react_mode"):
+                    entry["react_step"] = int(state.get("react_step") or 0)
                 if data.get("ack"):
                     entry.update({
                         "ack": True,
@@ -310,6 +324,8 @@ def executor_node(state: AgentState) -> dict:
                         "node_id": data.get("node_id"),
                         "model_type": data.get("model_type"),
                     })
+                if data.get("workflow_notes"):
+                    entry["workflow_notes"] = data["workflow_notes"]
                 results.append(entry)
                 events.append({"type": "action_result", "actionId": action_id,
                                "tool": tool_name, "ok": ok, "data": data})
@@ -337,6 +353,71 @@ def executor_node(state: AgentState) -> dict:
         "executable_actions": [],
         "events": events,
     }
+
+    # ReAct 观察：供下一拍 Thought 引用（含步号，便于失败回环）
+    if state.get("react_mode"):
+        prev_obs = list(state.get("observations") or [])
+        step_n = int(state.get("react_step") or 0)
+        for r in results:
+            data = r.get("data") if isinstance(r.get("data"), dict) else {}
+            prev_obs.append({
+                "react_step": r.get("react_step", step_n),
+                "tool": r.get("tool"),
+                "ok": r.get("ok"),
+                "summary": r.get("summary") or "",
+                "error": data.get("error") or data.get("error_code"),
+                "data": data,
+            })
+        out["observations"] = prev_obs[-12:]
+        # 本拍失败时打标，方便前端/下一拍感知
+        beat_fails = [r for r in results if not r.get("ok")]
+        if beat_fails:
+            events.append({
+                "type": "react_observation",
+                "step": step_n,
+                "ok": False,
+                "failures": [
+                    {"tool": r.get("tool"), "error": (r.get("data") or {}).get("error")}
+                    for r in beat_fails
+                ],
+            })
+            out["events"] = events
+
+    # load_skill：把规则累加进 state，下一拍立刻可用
+    skill_keys = list(state.get("selected_skill_keys") or [])
+    skill_text = state.get("skill_instructions") or ""
+    skill_changed = False
+    for r in results:
+        if r.get("tool") != "load_skill" or not r.get("ok"):
+            continue
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        instr = str(data.get("instructions") or "").strip()
+        loaded = list(data.get("loaded_keys") or [])
+        sk = str(data.get("skill_key") or "")
+        if sk and sk not in loaded:
+            loaded = [sk] + loaded
+        for k in loaded:
+            if k and k not in skill_keys:
+                skill_keys.append(k)
+                skill_changed = True
+        if instr:
+            block = f"\n\n## Skill: {data.get('name') or sk}\n{instr}"
+            if block.strip() not in skill_text:
+                skill_text = (skill_text + block).strip()
+                # 长度上限：保留尾部
+                if len(skill_text) > 12000:
+                    skill_text = skill_text[-12000:]
+                skill_changed = True
+            events.append({
+                "type": "skill_loaded",
+                "skill": data.get("name") or sk,
+                "keys": loaded or ([sk] if sk else []),
+            })
+    if skill_changed:
+        out["selected_skill_keys"] = skill_keys
+        out["skill_instructions"] = skill_text
+        out["skill_name"] = "+".join(skill_keys) if skill_keys else state.get("skill_name")
+
     # 把本轮新建节点 ID 写回待确认动作，解析 $created[N] / 空 node_id
     # （确认后二次执行时 created_ids 已不在作用域，必须在这里固化）
     if created_node_ids or last_created_node_id:

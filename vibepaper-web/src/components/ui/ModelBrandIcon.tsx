@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { ModelInfo } from '@/lib/types'
 
 export type ModelBrand =
+  | 'agnes'
   | 'deepseek'
   | 'qwen'
   | 'openai'
@@ -31,6 +32,7 @@ const BRAND_ICON_URL: Partial<Record<ModelBrand, string>> = {
 }
 
 const BRAND_META: Record<ModelBrand, { label: string; bg: string; fg: string }> = {
+  agnes: { label: 'A', bg: '#111827', fg: '#fff' },
   deepseek: { label: 'DS', bg: '#4d6bfe', fg: '#fff' },
   qwen: { label: 'QW', bg: '#615ced', fg: '#fff' },
   openai: { label: 'AI', bg: '#10a37f', fg: '#fff' },
@@ -53,6 +55,7 @@ export function resolveModelBrand(model: Pick<ModelInfo, 'name' | 'provider' | '
   const display = (typeof model === 'string' ? '' : model.displayName || '').toLowerCase()
   const hay = `${provider} ${name} ${display}`
 
+  if (/agnes/.test(hay)) return 'agnes'
   if (/deepseek/.test(hay)) return 'deepseek'
   if (/qwen|tongyi|通义/.test(hay)) return 'qwen'
   if (/gemini|google/.test(hay)) return 'google'

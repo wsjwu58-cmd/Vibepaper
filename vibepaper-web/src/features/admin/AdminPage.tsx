@@ -257,18 +257,18 @@ function ModelCreateButton({ onDone }: { onDone: () => void }) {
           modelType,
           provider:
             modelType === 'text'
-              ? 'openai-text'
+              ? 'agnes-text'
               : modelType === 'image'
-                ? 'mock-image'
+                ? 'agnes-image'
                 : modelType === 'video'
-                  ? 'mock-video'
+                  ? 'agnes-video'
                   : modelType === 'audio'
-                    ? 'mock-audio'
+                    ? 'doubao-tts'
                     : modelType === 'compose'
                       ? 'mock-compose'
                       : modelType === 'director'
                         ? 'mock-director'
-                        : 'mock-text',
+                        : 'openai-text',
           basePrice: Number(basePrice),
         }),
       }),

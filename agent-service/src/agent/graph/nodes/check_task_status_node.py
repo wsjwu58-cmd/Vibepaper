@@ -96,19 +96,6 @@ def _execute_downstream_submits(
     return results, labels, needs_reclock
 
 
-def _next_actions_for_status(status: str, note: dict) -> list[str]:
-    mt = note.get("model_type") or ""
-    if status != "succeeded":
-        return []
-    if mt == "text":
-        return ["等待下游自动提交", "调整分镜 Prompt", "添加角色卡"]
-    if mt == "image":
-        return ["等待视频自动提交", "换风格重做", "微调 Prompt"]
-    if mt == "video":
-        return ["等待成片自动合成", "换运镜重做", "抽帧 / 裁剪"]
-    return ["继续创作", "梳理画布", "给我三个方向"]
-
-
 _TASK_ERROR_TEXT = {
     "INSUFFICIENT_POINTS": "点数不足，请先充值",
     "CONTENT_BLOCKED": "内容未通过安全审核，建议调整画面描述",
@@ -166,12 +153,11 @@ def check_task_status_node(state: AgentState) -> dict:
     )
     status = str(result.get("status") or "unknown")
     fetch_failed = "error" in result and status in ("fetch_error", "unknown", "")
-    events = list(state.get("events") or [])
-    events.append({
+    events: list[dict] = [{
         "type": "task_status",
         "silent": status in ("queued", "running"),
         "data": result,
-    })
+    }]
 
     reply = ""
     reply_type = "task_status"
@@ -194,7 +180,7 @@ def check_task_status_node(state: AgentState) -> dict:
             "events": events,
             "reply": "暂时查不到任务状态，请稍后在画布查看，或点节点上的重试。",
             "reply_type": reply_type,
-            "next_actions": ["查看画布", "重试失败节点"],
+            "next_actions": [],
             "needs_reclock": False,
         }
 
@@ -205,7 +191,7 @@ def check_task_status_node(state: AgentState) -> dict:
 
     if status == "succeeded":
         reply = f"「{title}」生成完成，产物已写回画布。"
-        next_actions = _next_actions_for_status(status, note)
+        next_actions = []
         events.append({"type": "canvas_changed", "tool": "task_complete", "data": result})
 
         downstream_results, downstream_labels, ds_reclock = _execute_downstream_submits(
@@ -218,29 +204,28 @@ def check_task_status_node(state: AgentState) -> dict:
             if len(downstream_labels) > 4:
                 joined += f" 等 {len(downstream_labels)} 项"
             reply += f"\n依赖已就绪，已自动提交：{joined}。我会继续跟进生成状态。"
-            next_actions = ["等待下游生成完成", "调整 Prompt", "梳理画布"]
         else:
             reply += " 下游节点尚不可用或仍在排队，我会继续监控。"
 
     elif status == "failed":
         reason = _humanize_task_error(result)
         reply = f"「{title}」生成失败：{reason}。可以调整 Prompt 后重试，或换模型再试。"
-        next_actions = ["修改 Prompt 再生成", "换模型重做"]
+        next_actions = []
 
     elif status == "expired":
         reply = f"「{title}」排队超时，任务已过期，冻结的点数已自动退回。可以重新提交生成。"
-        next_actions = ["重新提交生成", "调整 Prompt 再试"]
+        next_actions = []
 
     elif status == "cancelled":
         reply = f"「{title}」任务已取消，未发生扣费。"
-        next_actions = ["重新提交生成"]
+        next_actions = []
 
     elif status == "settlement_error":
         reply = (
             f"「{title}」产物已写回画布，但点数结算异常；系统会自动重试结算，"
             "如发现点数异常请联系客服。"
         )
-        next_actions = ["查看点数流水", "继续创作"]
+        next_actions = []
 
     return {
         "executed_results": executed_results,
