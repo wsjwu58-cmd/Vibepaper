@@ -1,7 +1,7 @@
 """RocketMQ 收发（可选依赖 rocketmq-client-python；不可用则走 HTTP 降级）。"""
 
 try:
-    from rocketmq.client import Message, Producer, PushConsumer
+    from rocketmq.client import Message, Producer
 
     ROCKETMQ_AVAILABLE = True
 except Exception:  # pragma: no cover

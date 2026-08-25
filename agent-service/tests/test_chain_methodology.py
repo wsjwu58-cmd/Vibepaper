@@ -263,7 +263,7 @@ def test_reply_builder_collects_thinking_as_reasoning_block():
 
 
 def test_exec_reply_has_status_markers_and_next_steps():
-    from agent.graph.nodes.reply_builder import _build_reply_from_results, reply_builder_node
+    from agent.graph.nodes.reply_builder import _build_reply_from_results
 
     state = {
         "executed_results": [

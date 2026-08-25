@@ -7,8 +7,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..core.db import get_db
-from ..models import TaskOutput
-from ..services.model_service import model_service, seed_models
+from ..services.model_service import model_service
 from ..services.task_service import redis_client, task_service
 
 router = APIRouter()

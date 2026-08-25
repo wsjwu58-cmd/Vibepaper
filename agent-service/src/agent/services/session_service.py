@@ -6,12 +6,10 @@ import itertools
 import time
 from datetime import datetime, timezone
 
-import httpx
 from sqlalchemy.orm import Session
 
-from ..core.config import settings
 from ..models import AgentAction, AgentMessage, AgentSession
-from ..tools.registry import TOOLS, headers_for
+from ..tools.registry import TOOLS
 
 _id_seq = itertools.count(1)
 

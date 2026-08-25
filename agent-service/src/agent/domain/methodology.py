@@ -257,10 +257,6 @@ def audit_orchestration_actions(
                         async_ok = False
                         detail6 = "上游首帧尚未生成就提交了视频"
         # 更强约束：同轮创建了 image+video 时，submit 只应指向 image（或 text 根），不应有 video submit
-        video_submits = [
-            a for a in submits
-            if _params(a).get("model_type") == "video" or _tool(a) == "compose_final"
-        ]
         # compose 在短剧 bootstrap 不应同轮提交
         if any(_params(a).get("model_type") == "video" for a in submits):
             # 允许：仅当没有同轮 image→video 边（已有选中就绪图）

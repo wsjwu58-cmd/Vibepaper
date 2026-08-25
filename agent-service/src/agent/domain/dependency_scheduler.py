@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from ..agent.planner import PlannedAction
 from .dependency_graph import input_edges, topo_sort_executable
 from .video_task import video_submit_from_node

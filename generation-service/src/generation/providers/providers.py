@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import os
 import random
 import shutil
 import subprocess
-import wave
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -348,7 +346,7 @@ class MockImageProvider(ModelProvider):
     name = "mock-image"
 
     def generate(self, request: GenerationRequest) -> ProviderJob:
-        from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+        from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
         prompt = build_generation_prompt(request.params) or "default"
         operation = str(request.params.get("operation") or "")

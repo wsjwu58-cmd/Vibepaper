@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import uuid
@@ -17,7 +16,6 @@ from ...domain.turn_policy import (
 from ...core.config import settings
 from ...domain.llm_prompt import build_chat_messages
 from ...domain.plan_models import PlanStep, StructuredPlan, extract_misplaced_actions, plan_to_dict
-from ...domain.skill_catalog import skill_instructions_bundle
 from ..state import AgentState
 
 logger = logging.getLogger("agent.graph.react_agent")

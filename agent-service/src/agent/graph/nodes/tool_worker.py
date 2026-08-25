@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from ...core.db import SessionLocal
-from ...models import AgentAction, AgentMessage
+from ...models import AgentAction
 from ...services.telemetry import agent_action_fail, agent_action_success
 from ...tools.registry import TOOLS
 from ..state import AgentState, PlannedActionDict
