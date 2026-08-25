@@ -1,0 +1,121 @@
+name: CI
+
+# 触发条件：push 到 dev/main 分支，或向 dev/main 发起 PR
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# 同分支新推送取消旧运行，节省额度
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Java 微服务：Maven 编译 + verify（含 Flyway 迁移检查）
+  # 对齐 AGENTS.md §9.3 门禁：规范检查 → 单元测试 → 迁移测试
+  # ──────────────────────────────────────────────
+  java-services:
+    name: Java 服务 (Maven verify)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: vibepaper-services
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: vibepaper-services/pom.xml
+
+      - name: Maven verify（编译 + 测试 + 打包）
+        run: mvn -B -ntp -T 1C verify
+
+  # ──────────────────────────────────────────────
+  # Python 服务：ruff 规范检查 + pytest 单元测试
+  # agent-service / generation-service 矩阵并行
+  # ──────────────────────────────────────────────
+  python-services:
+    name: Python ${{ matrix.service }} (ruff + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [agent-service, generation-service]
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.service }}/uv.lock
+
+      - name: 安装项目依赖
+        run: uv sync
+
+      - name: 安装开发工具 (ruff, pytest)
+        run: uv pip install ruff pytest
+
+      - name: Ruff 规范检查
+        run: uv run ruff check src tests
+
+      - name: Pytest 单元测试
+        run: uv run pytest -q
+
+  # ──────────────────────────────────────────────
+  # 前端：oxlint 规范检查 + Vite 生产构建
+  # ──────────────────────────────────────────────
+  web:
+    name: 前端 (oxlint + vite build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: vibepaper-web
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: vibepaper-web/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (oxlint)
+        run: pnpm lint
+
+      - name: 构建 (tsc + vite build)
+        run: pnpm build
