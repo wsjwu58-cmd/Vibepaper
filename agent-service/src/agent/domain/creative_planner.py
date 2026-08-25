@@ -525,55 +525,234 @@ def _compile_short_drama(
     )
 
 
-def _compile_simple_visual(content: str, skill: SkillDef, creative: dict[str, Any]) -> StructuredPlan:
-    theme = extract_theme(content)
-    prompt = str(creative.get("script_prompt") or creative.get("keyframe_prompt") or "").strip()
-    if not prompt and creative.get("shots"):
-        prompt = str(creative["shots"][0].get("keyframe_prompt") or "")
-    if _blank_or_dump(prompt, content):
-        prompt = build_node_prompt(role="image", user_theme=content, shot_index=1, shot_count=1, goal=theme)
-        if prompt:
-            prompt = f"【{skill.name}】{prompt}"
+def _placement_beside_selection(
+    selected: list[int],
+    canvas: dict[str, Any] | None,
+    *,
+    default_x: float = 240,
+    default_y: float = 180,
+) -> tuple[float, float]:
+    if not selected or not canvas:
+        return default_x, default_y
+    nodes = {
+        int(n["id"]): n
+        for n in (canvas.get("selectedNodes") or canvas.get("nodes") or [])
+        if n.get("id") is not None
+    }
+    xs, ys = [], []
+    for sid in selected:
+        n = nodes.get(int(sid))
+        if not n:
+            continue
+        xs.append(float(n.get("x") or default_x))
+        ys.append(float(n.get("y") or default_y))
+    if not xs:
+        return default_x, default_y
+    return max(xs) + 300, sum(ys) / len(ys)
 
+
+def _selected_connect_ids(
+    selected: list[int],
+    canvas: dict[str, Any] | None,
+    *,
+    prefer_dual_images: bool = False,
+) -> list[int]:
+    """多选连线顺序：双图首尾帧时图优先，其余文本随后。"""
+    ids = [int(s) for s in selected[:4]]
+    if not prefer_dual_images or not canvas:
+        return ids
+    nodes = {
+        int(n["id"]): n
+        for n in (canvas.get("selectedNodes") or canvas.get("nodes") or [])
+        if n.get("id") is not None
+    }
+    image_ids = [
+        int(sid) for sid in selected
+        if str((nodes.get(int(sid)) or {}).get("type") or "") == "image"
+    ]
+    other_ids = [int(sid) for sid in selected if int(sid) not in image_ids]
+    if len(image_ids) >= 2:
+        return image_ids[:2] + other_ids[:2]
+    if image_ids:
+        return image_ids + other_ids
+    return ids
+
+
+def _steps_connect_selected(
+    *,
+    selected: list[int],
+    target_created_idx: int,
+    depends_on: list[str],
+    canvas: dict[str, Any] | None = None,
+    prefer_dual_images: bool = False,
+) -> list[PlanStep]:
+    if not selected:
+        return []
+    connect_ids = _selected_connect_ids(
+        selected, canvas, prefer_dual_images=prefer_dual_images,
+    )
+    target = f"$created[{int(target_created_idx)}]"
+    edges = [
+        {
+            "sourceNodeId": int(sid),
+            "targetNodeId": target,
+            "dependencyType": "input",
+        }
+        for sid in connect_ids
+    ]
+    reason = "选中参考经 input 喂给 Skill 产物节点"
+    if prefer_dual_images and len(connect_ids) >= 2:
+        reason += "；多图按顺序作首帧/尾帧"
+    return [
+        PlanStep(
+            id=_sid("conn-sel"),
+            kind="edit",
+            title="连接选中参考 → Skill 产物",
+            purpose=reason,
+            depends_on=list(depends_on),
+            payload={"tool": "connect_nodes", "params": {"edges": edges}},
+        ),
+    ]
+
+
+def _visual_image_prompts(
+    content: str,
+    skill: SkillDef,
+    creative: dict[str, Any],
+    theme: str,
+    count: int,
+) -> list[str]:
+    prompts: list[str] = []
+    shots = [s for s in (creative.get("shots") or []) if isinstance(s, dict)]
+    for i in range(count):
+        raw = ""
+        if i == 0:
+            raw = str(creative.get("script_prompt") or creative.get("keyframe_prompt") or "").strip()
+        if not raw and i < len(shots):
+            raw = str(shots[i].get("keyframe_prompt") or "").strip()
+        if _blank_or_dump(raw, content):
+            raw = build_node_prompt(
+                role="image", user_theme=content, shot_index=i + 1, shot_count=count, goal=theme,
+            )
+            if raw:
+                raw = f"【{skill.name}】{raw}"
+                if count > 1:
+                    raw = f"{raw}（第 {i + 1}/{count} 幅，叙事连贯）"
+        prompts.append(raw or f"{skill.name}：{theme}")
+    return prompts
+
+
+def _compile_simple_visual(
+    content: str,
+    skill: SkillDef,
+    creative: dict[str, Any],
+    *,
+    selected_nodes: list[int] | None = None,
+    canvas_context: dict[str, Any] | None = None,
+) -> StructuredPlan:
+    """视觉 Skill playbook：落图节点；有选中则连参考再提交。三联图落 3 张。"""
+    theme = extract_theme(content)
+    selected = [int(x) for x in (selected_nodes or [])]
+    count = 3 if skill.key == "cinematic-triptych" else 1
+    prompts = _visual_image_prompts(content, skill, creative, theme, count)
     ratio = (skill.default_constraints or {}).get("ratio")
-    params: dict[str, Any] = {"prompt": prompt, "title": skill.name, "model": IMAGE_PREF_MODEL}
-    if ratio:
-        params["ratio"] = ratio
+    base_x, base_y = _placement_beside_selection(selected, canvas_context)
+
+    nodes: list[dict[str, Any]] = []
+    for i, prompt in enumerate(prompts):
+        params: dict[str, Any] = {
+            "prompt": prompt,
+            "title": skill.name if count == 1 else f"{skill.name}·{i + 1}",
+            "model": IMAGE_PREF_MODEL,
+        }
+        if ratio:
+            params["ratio"] = ratio
+        nodes.append({
+            "type": "image",
+            "creativeType": "keyframe",
+            "x": base_x + i * 40,
+            "y": base_y + i * 160,
+            "params": params,
+            "prompt": prompt,
+        })
 
     s_read = _sid("read")
     s_create = _sid("edit")
-    s_exec = _sid("exec")
-    steps = [
-        PlanStep(id=s_read, kind="read", title="读取画布", purpose="确认上下文",
-                 payload={"tool": "get_canvas_summary", "params": {}}),
+    steps: list[PlanStep] = [
         PlanStep(
-            id=s_create, kind="edit", title=f"创建「{skill.name}」节点",
-            purpose=skill.description,
-            depends_on=[s_read],
-            payload={"tool": "create_nodes", "params": {"nodes": [{
-                "type": "image", "creativeType": "keyframe",
-                "x": 240, "y": 180, "params": params, "prompt": prompt,
-            }]}},
+            id=s_read, kind="read", title="读取画布", purpose="确认上下文",
+            payload={"tool": "get_canvas_summary", "params": {}},
         ),
         PlanStep(
-            id=s_exec, kind="exec", title="提交生成",
+            id=s_create, kind="edit",
+            title=f"创建「{skill.name}」{'三联' if count == 3 else ''}节点",
+            purpose=skill.description,
+            depends_on=[s_read],
+            payload={"tool": "create_nodes", "params": {"nodes": nodes}},
+        ),
+    ]
+    # 选中参考接到第一张（人像/海报风格迁移）；三联图三张都吃同一参考
+    dep_after_create = [s_create]
+    if selected:
+        for i in range(count):
+            conn_steps = _steps_connect_selected(
+                selected=selected,
+                target_created_idx=i,
+                depends_on=dep_after_create,
+                canvas=canvas_context,
+            )
+            if conn_steps:
+                steps.extend(conn_steps)
+                dep_after_create = [conn_steps[-1].id]
+
+    # 三联：按叙事顺序串起来
+    if count >= 2:
+        chain_edges = [
+            {
+                "sourceNodeId": f"$created[{i}]",
+                "targetNodeId": f"$created[{i + 1}]",
+                "dependencyType": "reference",
+            }
+            for i in range(count - 1)
+        ]
+        s_chain = _sid("conn-trip")
+        steps.append(PlanStep(
+            id=s_chain, kind="edit", title="三联叙事顺序连线",
+            purpose="用 reference 表达阅读顺序，不阻断各自生成",
+            depends_on=dep_after_create,
+            payload={"tool": "connect_nodes", "params": {"edges": chain_edges}},
+        ))
+        dep_after_create = [s_chain]
+
+    for i, prompt in enumerate(prompts):
+        steps.append(PlanStep(
+            id=_sid(f"exec-{i}"), kind="exec",
+            title="提交生成" if count == 1 else f"提交第 {i + 1} 幅",
             purpose="生成画面",
-            depends_on=[s_create],
+            depends_on=dep_after_create if i == 0 else [steps[-1].id],
             payload={"tool": "submit_generation", "params": {
-                "node_id": "$created[0]",
+                "node_id": f"$created[{i}]",
                 "model_type": "image",
                 "model_params": {"prompt": prompt, "count": 1},
                 "estimated_cost": 8,
             }},
-        ),
-    ]
+        ))
+
+    reply = str(creative.get("reply") or (
+        f"已创建「{skill.name}」三联并提交生成。" if count == 3
+        else f"已创建「{skill.name}」并提交生成。"
+    ))
+    if selected and not creative.get("reply"):
+        reply = f"已基于选中参考创建「{skill.name}」并提交生成。"
     return StructuredPlan(
         goal=str(creative.get("goal") or f"{skill.name}：{theme}"),
         workflow=skill.key,
         steps=steps,
         completion_criteria=[f"「{skill.name}」节点已提交生成"],
-        reply=str(creative.get("reply") or f"已创建「{skill.name}」并提交生成。"),
-        thinking=str(creative.get("thinking") or ""),
+        reply=reply,
+        thinking=str(creative.get("thinking") or (
+            "Skill 视觉 playbook：选中作 input，产物独立落节点。" if selected else ""
+        )),
         next_actions=list(creative.get("next_actions") or []),
     )
 
@@ -622,10 +801,16 @@ def _compile_text_chain(
     *,
     skeleton: list[str],
     no_exec: bool,
+    selected_nodes: list[int] | None = None,
+    canvas_context: dict[str, Any] | None = None,
 ) -> StructuredPlan:
     """按 Skill 骨架落文本/单图链路，不套短剧成片脚手架。"""
     theme = extract_theme(content) or str(creative.get("goal") or skill.name)
     labels = skeleton or list(skill.workflow_skeleton)
+    selected = [int(x) for x in (selected_nodes or [])]
+    base_x, base_y = _placement_beside_selection(
+        selected, canvas_context, default_x=140, default_y=160,
+    )
     nodes: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for label in labels:
@@ -643,8 +828,8 @@ def _compile_text_chain(
         nodes.append({
             "type": ntype,
             "creativeType": ctype,
-            "x": 140 + len(nodes) * 220,
-            "y": 160,
+            "x": base_x + len(nodes) * 220,
+            "y": base_y,
             "params": params,
             "prompt": prompt,
         })
@@ -666,6 +851,23 @@ def _compile_text_chain(
         payload={"tool": "create_nodes", "params": {"nodes": nodes}},
         idempotency_key=f"skill-chain:{skill.key}:{theme[:40]}",
     ))
+    last_dep = [s_create]
+    # 选中参考接到首个 image（风格迁移/参考图）；无图则接到链起点
+    if selected:
+        target_idx = 0
+        for i, n in enumerate(nodes):
+            if n.get("type") == "image":
+                target_idx = i
+                break
+        conn_sel = _steps_connect_selected(
+            selected=selected,
+            target_created_idx=target_idx,
+            depends_on=last_dep,
+            canvas=canvas_context,
+        )
+        if conn_sel:
+            steps.extend(conn_sel)
+            last_dep = [conn_sel[-1].id]
     if len(nodes) >= 2:
         edges = [
             {
@@ -675,43 +877,55 @@ def _compile_text_chain(
             }
             for i in range(len(nodes) - 1)
         ]
+        s_conn = _sid("conn")
         steps.append(PlanStep(
-            id=_sid("conn"), kind="edit", title="按骨架顺序连线",
+            id=s_conn, kind="edit", title="按骨架顺序连线",
             purpose="上游产物作为下游 input",
-            depends_on=[s_create],
+            depends_on=last_dep,
             payload={"tool": "connect_nodes", "params": {"edges": edges}},
         ))
+        last_dep = [s_conn]
     steps.append(PlanStep(
         id=_sid("layout"), kind="edit", title="整理布局",
         purpose="依赖图可视化",
-        depends_on=[steps[-1].id],
+        depends_on=last_dep,
         payload={"tool": "layout_nodes", "params": {"layout": "auto"}},
     ))
     if not no_exec:
-        first_type = nodes[0].get("type") or "text"
+        # 有选中参考时，链起点已有上游，优先提交第一个 image；否则提交文本起点
+        exec_idx = 0
+        if selected:
+            for i, n in enumerate(nodes):
+                if n.get("type") == "image":
+                    exec_idx = i
+                    break
+        first_type = nodes[exec_idx].get("type") or "text"
         if first_type in ("text", "image", "audio"):
             cost = {"text": 5, "image": 8, "audio": 10}.get(first_type, 5)
             steps.append(PlanStep(
                 id=_sid("exec-root"), kind="exec", title="提交链起点生成",
-                purpose="只提交无上游依赖的起点",
+                purpose="提交可执行起点；有选中参考时优先提交画面节点",
                 depends_on=[steps[-1].id],
                 payload={
                     "tool": "submit_generation",
                     "params": {
-                        "node_id": "$created[0]",
+                        "node_id": f"$created[{exec_idx}]",
                         "model_type": first_type,
-                        "model_params": {"prompt": nodes[0].get("prompt"), "count": 1},
+                        "model_params": {"prompt": nodes[exec_idx].get("prompt"), "count": 1},
                         "estimated_cost": cost,
                     },
                 },
             ))
+    reply = str(creative.get("reply") or f"已按 Skill「{skill.name}」搭建工作流。")
+    if selected and not creative.get("reply"):
+        reply = f"已基于选中参考按 Skill「{skill.name}」搭建工作流。"
     return StructuredPlan(
         goal=str(creative.get("goal") or f"{skill.name}：{theme}"),
         workflow=skill.key,
         steps=steps,
         assumptions=list(creative.get("assumptions") or []) + [f"骨架：{' → '.join(labels)}"],
         completion_criteria=list(creative.get("completion_criteria") or [f"已按「{skill.name}」落节点"]),
-        reply=str(creative.get("reply") or f"已按 Skill「{skill.name}」搭建工作流。"),
+        reply=reply,
         thinking=str(creative.get("thinking") or f"结构来自 {skill.key} 骨架，内容来自创意规划。"),
         next_actions=list(creative.get("next_actions") or []),
         user_decision_required=bool(creative.get("ask_user")),
@@ -727,6 +941,7 @@ def compile_execution_plan(
     creative: dict[str, Any],
     canvas_context: dict[str, Any] | None = None,
     skill_keys: list[str] | None = None,
+    selected_nodes: list[int] | None = None,
 ) -> StructuredPlan:
     from .pipeline import (
         canvas_has_workflow,
@@ -736,11 +951,13 @@ def compile_execution_plan(
         wants_rebuild_workflow,
     )
 
+    selected = [int(x) for x in (selected_nodes or [])]
+
     def _legacy_to_structured(legacy, *, goal: str, workflow: str) -> StructuredPlan:
         steps = [
             PlanStep(
                 id=_sid("reuse"),
-                kind="exec" if a.tool_name in ("submit_generation", "compose_final", "upscale") else (
+                kind="exec" if a.tool_name in ("submit_generation", "compose_final", "upscale", "outpaint", "extract_frames", "trim_clip") else (
                     "read" if a.tool_name.startswith(("get_", "list_", "search_")) else "edit"
                 ),
                 title=a.summary or a.tool_name,
@@ -762,10 +979,44 @@ def compile_execution_plan(
         )
 
     from .pipeline import wants_new_independent_create
+    from ..agent.planner import (
+        PlanResult,
+        _infer_node_type,
+        _plan_create_media,
+        _plan_media_process,
+        classify_intent,
+    )
+
+    # Cookbook 加工意图：扩图/超分/抽帧/剪辑（优先于短剧铁路）
+    process_intent = classify_intent(content)
+    if process_intent in ("outpaint", "upscale", "extract_frames", "trim_clip"):
+        meta = {
+            "outpaint": ("扩图（派生新图节点）", "从源图派生扩图，源图保留", 12),
+            "upscale": ("超分（派生新节点）", "源与结果分离", 12),
+            "extract_frames": ("抽帧（派生新图节点）", "从源视频派生关键帧", 8),
+            "trim_clip": ("剪辑（派生新视频节点）", "从源视频派生片段", 8),
+        }[process_intent]
+        legacy_actions = _plan_media_process(
+            content, selected, process_intent,
+            summary=meta[0], reasoning=meta[1], estimated_cost=meta[2],
+        )
+        return _legacy_to_structured(
+            PlanResult(
+                actions=legacy_actions,
+                reply=f"已按「{meta[0]}」规划加工。",
+                thinking=str(creative.get("thinking") or meta[1]),
+                next_actions=list(creative.get("next_actions") or []),
+            ),
+            goal=str(creative.get("goal") or meta[0]),
+            workflow=f"media_process:{process_intent}",
+        )
 
     # 画布已有链路时：合成/推进优先，禁止再脚手架一套短剧。
     # 但用户明确要「独立新建」时绝不劫持成「成片已就绪」汇报。
     skip_workflow_rails = wants_new_independent_create(content) or wants_rebuild_workflow(content)
+    # 有选中参考要派生新媒体时，也不走成片铁路
+    if selected and process_intent in ("create", "generate"):
+        skip_workflow_rails = True
     if (
         canvas_context
         and canvas_has_workflow(canvas_context)
@@ -779,7 +1030,7 @@ def compile_execution_plan(
             )
         if intent_name == "advance_pipeline":
             return _legacy_to_structured(
-                plan_advance_pipeline(canvas_context),
+                plan_advance_pipeline(canvas_context, selected),
                 goal="推进未完成流程",
                 workflow="advance_pipeline",
             )
@@ -789,15 +1040,20 @@ def compile_execution_plan(
         compose = int(creative_counts.get("composite") or type_counts.get("compose") or 0)
         if clips >= 2 or compose >= 1:
             return _legacy_to_structured(
-                plan_advance_pipeline(canvas_context),
+                plan_advance_pipeline(canvas_context, selected),
                 goal="推进已有工作流",
                 workflow="advance_pipeline",
             )
 
-    # 简单独立媒体创建：不依赖创意 LLM，直接落单节点+提交
-    from ..agent.planner import PlanResult, _infer_node_type, _plan_create_media
-
+    # 简单独立媒体创建 / 选中参考派生：不依赖创意 LLM，直接落节点+连线+提交
+    # 若已指定视觉/文本 Skill，交给后续 Skill 编译，避免「电影海报」被降成裸 create
     ntype = _infer_node_type(content)
+    early_keys = list(skill_keys or []) or resolve_route_keys(requested_skill)
+    if not early_keys:
+        early_keys = resolve_route_keys(str(creative.get("selected_skill") or creative.get("workflow") or ""))
+    early_profile = compile_profile_for(primary_skill_key(early_keys))
+    skill_owns_compile = early_profile in ("simple_visual", "text_chain", "short_drama")
+
     looks_like_simple_media = (
         wants_new_independent_create(content)
         and ntype in ("image", "video", "audio")
@@ -805,15 +1061,28 @@ def compile_execution_plan(
     ) or (
         intent_name == "direct_canvas_action"
         and ntype in ("image", "video", "audio")
+    ) or (
+        # 有选中参考 + 要出图/视频 → 派生链路
+        bool(selected)
+        and ntype in ("image", "video", "audio")
+        and process_intent in ("create", "generate", "general")
+        and not re.search(r"短剧|分镜|工作流|链路", content or "", re.I)
     )
-    if looks_like_simple_media:
-        legacy_actions = _plan_create_media(content, [])
+    if looks_like_simple_media and not skill_owns_compile:
+        legacy_actions = _plan_create_media(content, selected, canvas_context)
         if legacy_actions:
+            reply = (
+                f"已基于选中参考创建{ntype}节点并提交生成。"
+                if selected
+                else f"已创建独立{ntype}节点并提交生成。"
+            )
             return _legacy_to_structured(
                 PlanResult(
                     actions=legacy_actions,
-                    reply=f"已创建独立{ntype}节点并提交生成。",
-                    thinking=str(creative.get("thinking") or "独立单点创建，不走成片/短剧铁路。"),
+                    reply=reply,
+                    thinking=str(creative.get("thinking") or (
+                        "选中参考派生，源与结果分离。" if selected else "独立单点创建，不走成片/短剧铁路。"
+                    )),
                     next_actions=list(creative.get("next_actions") or []),
                 ),
                 goal=str(creative.get("goal") or extract_theme(content) or "独立创建"),
@@ -893,7 +1162,11 @@ def compile_execution_plan(
         )
 
     if profile == "simple_visual" and primary:
-        return _compile_simple_visual(content, primary, creative)
+        return _compile_simple_visual(
+            content, primary, creative,
+            selected_nodes=selected,
+            canvas_context=canvas_context,
+        )
 
     if profile == "text_chain" and primary:
         skeleton = list(primary.workflow_skeleton)
@@ -906,6 +1179,8 @@ def compile_execution_plan(
         return _compile_text_chain(
             content, primary, {**creative, "skip_steps": trim["skip_labels"]},
             skeleton=skeleton, no_exec=no_exec,
+            selected_nodes=selected,
+            canvas_context=canvas_context,
         )
 
     if profile != "short_drama" and not _has_llm_creative_payload(creative):
@@ -946,6 +1221,7 @@ def build_structured_plan(
     project_memories: list[dict[str, Any]] | None = None,
     long_term_prefs: list[str] | None = None,
     observations: list[dict[str, Any]] | None = None,
+    selected_nodes: list[int] | None = None,
 ) -> StructuredPlan:
     keys = list(skill_keys or []) or resolve_route_keys(intent.get("requested_skill"))
     primary = get_skill(primary_skill_key(keys) or "")
@@ -1018,6 +1294,7 @@ def build_structured_plan(
         creative=creative,
         canvas_context=canvas_context,
         skill_keys=keys,
+        selected_nodes=selected_nodes,
     )
 
 

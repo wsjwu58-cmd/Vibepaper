@@ -108,7 +108,7 @@ def planner_node(state: AgentState) -> dict:
         if a.tool_name == "delete_nodes" and not params.get("node_ids") and selected:
             params["node_ids"] = selected
         if a.tool_name in ("submit_generation", "update_node_config", "change_model", "replace_output",
-                           "extract_frames", "trim_clip", "upscale", "compose_final", "capture_3d_scene"):
+                           "extract_frames", "trim_clip", "upscale", "outpaint", "compose_final", "capture_3d_scene"):
             if not params.get("node_id") and not params.get("nodeId") and selected:
                 params["node_id"] = selected[0]
         planned.append({

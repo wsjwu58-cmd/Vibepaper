@@ -7,6 +7,7 @@ from ..state import AgentState
 TOOL_LABELS = {
     "get_canvas_summary": "读取画布",
     "get_selected_nodes": "读取选中节点",
+    "get_node_detail": "读取节点详情",
     "list_models": "查询模型",
     "search_assets": "查询资源",
     "create_nodes": "编辑画布",
@@ -18,6 +19,11 @@ TOOL_LABELS = {
     "replace_output": "覆盖输出",
     "submit_generation": "提交生成",
     "check_task_status": "查询任务",
+    "extract_frames": "抽帧",
+    "trim_clip": "剪辑",
+    "upscale": "超分",
+    "outpaint": "扩图",
+    "compose_final": "合成成片",
 }
 
 

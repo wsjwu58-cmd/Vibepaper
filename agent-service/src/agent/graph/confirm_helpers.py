@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 EXPLICIT_EXEC = re.compile(
-    r"生成|提交|做成|转换|图生视频|删除|移除|覆盖|重做|重跑",
+    r"生成|提交|做成|转换|图生视频|删除|移除|覆盖|重做|重跑|扩图|超分|抽帧|提帧|剪辑",
     re.I,
 )
 
@@ -30,6 +30,7 @@ def should_auto_confirm(user_content: str, tool_name: str) -> bool:
         "extract_frames",
         "trim_clip",
         "upscale",
+        "outpaint",
         "compose_final",
         "capture_3d_scene",
     ):

@@ -44,6 +44,10 @@ INTENT_RULES = [
         r"总脚本.*分镜|推进.*视频层|拼接成片",
         re.I,
     ), "orchestrate_workflow"),
+    (re.compile(r"扩图|outpaint|扩展画面|向外扩", re.I), "outpaint"),
+    (re.compile(r"超分|upscale|提升清晰|变清晰|高清化", re.I), "upscale"),
+    (re.compile(r"抽帧|提帧|提取.*帧|关键帧|extract.?frame", re.I), "extract_frames"),
+    (re.compile(r"剪辑|裁剪片段|截取片段|trim|剪一段", re.I), "trim_clip"),
     (re.compile(r"梳理|总结|概括|画布.*脉络|summarize|overview", re.I), "summarize"),
     (re.compile(r"文案|slogan|标语|品牌语|copy|tagline", re.I), "copy"),
     (re.compile(r"方向|延展|脑暴|三个|brainstorm|ideas?", re.I), "directions"),
@@ -71,7 +75,7 @@ def infer_query_scope(intent: str) -> str:
     """缺了才查：按意图决定上下文查询范围。"""
     if intent in ("summarize", "copy", "directions", "layout", "general", "advance_pipeline", "reregenerate_stale", "orchestrate_workflow"):
         return "summary"
-    if intent in ("update", "delete", "model", "generate"):
+    if intent in ("update", "delete", "model", "generate", "outpaint", "upscale", "extract_frames", "trim_clip"):
         return "selected"
     if intent in ("create", "connect", "search"):
         return "related"
@@ -100,12 +104,20 @@ def _wants_add_to_canvas(content: str) -> bool:
     ))
 
 
+def _wants_inplace_regenerate(content: str) -> bool:
+    """明确要求在原节点上重跑，而不是派生新节点。"""
+    return bool(re.search(
+        r"重新生成|重跑|再生成一次|在这个节点|当前节点|原节点|就地生成|覆盖生成",
+        content,
+    ))
+
+
 def _infer_node_type(content: str) -> str:
     """产物决定节点类型：媒介词优先于主体词（「角色视频」→ video，不是 image）。"""
     if re.search(r"音频|音乐|配音|旁白|音效", content, re.I):
         return "audio"
-    # 视频/短片优先——避免被「角色/形象」误判成 image
-    if re.search(r"视频|短片|动画|图生视频", content, re.I):
+    # 视频/短片优先——避免被「角色/形象」误判成 image；首尾帧默认出视频
+    if re.search(r"视频|短片|动画|图生视频|首尾帧|首帧.?尾帧|尾帧", content, re.I):
         return "video"
     if re.search(
         r"图片|形象|插画|海报|角色|人物|狼|兽|铠甲|绘画|画一张|出图|镜头|"
@@ -119,18 +131,47 @@ def _infer_node_type(content: str) -> str:
     return "text"
 
 
-def _plan_create_media(content: str, selected: list[int]) -> list[PlannedAction]:
-    """创建媒体节点并提交生成（无选中节点时新建）。"""
+def _plan_create_media(
+    content: str,
+    selected: list[int],
+    canvas: dict | None = None,
+) -> list[PlannedAction]:
+    """创建媒体节点并提交生成；有选中参考时连线再提交新建节点。
+
+    多选策略：
+    - 文本/图/视频均可作为 input 上游（提交时注入 referenceTexts / referenceImages）
+    - 目标为 video 且选中 ≥2 张图时，按顺序连前两张（首帧+尾帧候选）
+    """
     from ..domain.prompt_builder import extract_theme, prompt_for_media_create
 
     node_type = _infer_node_type(content)
-    # 单点创建不用分镜流水线的 keyframe/clip 标签，避免 prompt 变成「镜头1/基于首帧」空壳
+    # 选中已是图片且用户要做视频 → 走图生视频更合适，但本函数被显式调用时仍按推断类型
     prompt = prompt_for_media_create(content, node_type)
     title = extract_theme(content)[:40] or prompt[:40]
+
+    # 根据选中节点摆放：落在选中包围盒右侧
+    base_x, base_y = 220, 180
+    if selected and canvas:
+        nodes = {
+            int(n["id"]): n
+            for n in (canvas.get("selectedNodes") or canvas.get("nodes") or [])
+            if n.get("id") is not None
+        }
+        xs, ys = [], []
+        for sid in selected:
+            n = nodes.get(int(sid))
+            if not n:
+                continue
+            xs.append(float(n.get("x") or 220))
+            ys.append(float(n.get("y") or 180))
+        if xs:
+            base_x = max(xs) + 300
+            base_y = sum(ys) / len(ys)
+
     node: dict = {
         "type": node_type,
-        "x": 220,
-        "y": 180,
+        "x": base_x if selected else 220,
+        "y": base_y,
         "params": {"prompt": prompt, "title": title},
         "prompt": prompt,
     }
@@ -138,20 +179,68 @@ def _plan_create_media(content: str, selected: list[int]) -> list[PlannedAction]
         node["params"]["model"] = IMAGE_PREF_MODEL
     elif node_type == "video":
         node["params"]["model"] = VIDEO_PREF_MODEL
-    actions: list[PlannedAction] = [
-        PlannedAction(
-            "create_nodes", {"nodes": [node]}, f"在画布创建 {node_type} 节点",
-            f"产物是{node_type}，独立成节点——可单独重跑、单独替换，不依赖其他节点",
+        from ..domain.workflow_rails import backfill_video_node_params
+        node["params"] = backfill_video_node_params(node["params"], user_content=content)
+
+    actions: list[PlannedAction] = []
+    if selected:
+        actions.append(PlannedAction(
+            "get_selected_nodes", {"node_ids": list(selected)}, "读取选中参考节点",
+            "确认参考节点的提示词、参数、产物与连接，再派生下游",
+        ))
+    actions.append(PlannedAction(
+        "create_nodes", {"nodes": [node]}, f"在画布创建 {node_type} 节点",
+        (
+            f"以选中节点为上游参考，新建独立 {node_type} 节点（源与结果分离）"
+            if selected
+            else f"产物是{node_type}，独立成节点——可单独重跑、单独替换"
         ),
-    ]
+    ))
+    if selected:
+        # video / 首尾帧：图优先按选中顺序取前 2 张，文本随后
+        connect_ids = list(selected[:4])
+        prefer_dual = node_type == "video" or bool(
+            re.search(r"首尾帧|首帧.?尾帧", content or "", re.I)
+        )
+        if prefer_dual and canvas:
+            nodes = {
+                int(n["id"]): n
+                for n in (canvas.get("selectedNodes") or canvas.get("nodes") or [])
+                if n.get("id") is not None
+            }
+            image_ids = [
+                int(sid) for sid in selected
+                if str((nodes.get(int(sid)) or {}).get("type") or "") == "image"
+            ]
+            other_ids = [int(sid) for sid in selected if int(sid) not in image_ids]
+            if len(image_ids) >= 2:
+                connect_ids = image_ids[:2] + other_ids[:2]
+            elif image_ids:
+                connect_ids = image_ids + other_ids
+        edges = [
+            {
+                "sourceNodeId": int(sid),
+                "targetNodeId": "$created[0]",
+                "dependencyType": "input",
+            }
+            for sid in connect_ids
+        ]
+        reason = "参考图/文本经 input 依赖喂给下游；提交时自动注入 reference"
+        if prefer_dual and len(connect_ids) >= 2:
+            reason += "；多图时按连线顺序装首帧/尾帧"
+        actions.append(PlannedAction(
+            "connect_nodes", {"edges": edges}, "连接选中参考 → 新节点",
+            reason,
+        ))
     if node_type in ("image", "video", "audio", "text"):
         cost = {"image": 8, "video": 30, "audio": 10, "text": 8}.get(node_type, 10)
         actions.append(PlannedAction("submit_generation", {
-            "node_id": (selected or [None])[0],
+            "node_id": "$created[0]",
             "model_type": node_type,
             "model_params": {"prompt": prompt, "count": 1},
             "estimated_cost": cost,
-        }, f"提交{node_type}生成任务", "无上游依赖，输入已就绪，配好即提交"))
+        }, f"提交{node_type}生成任务",
+           "提交新建节点；若已连参考，生成侧会自动带上上游产物"))
     return actions
 
 
@@ -348,23 +437,63 @@ def _plan_image_to_video(content: str, selected: list[int], canvas: dict | None 
         }],
     }, "创建视频生成节点", "从已有图片派生新视频节点，源图不动（源和结果分离）"))
     if selected:
-        actions.append(PlannedAction("connect_nodes", {
-            "edges": [{
-                "sourceNodeId": selected[0],
-                "targetNodeId": None,
+        # 多选图片：首帧 + 可选尾帧都连到新视频节点
+        edges = [
+            {
+                "sourceNodeId": int(sid),
+                "targetNodeId": "$created[0]",
                 "dependencyType": "input",
-            }],
-        }, "将图片连接到视频节点", "图片作为视频的首帧上游，保持画面一致"))
+            }
+            for sid in selected[:2]
+        ]
+        actions.append(PlannedAction(
+            "connect_nodes", {"edges": edges}, "将参考图连接到视频节点",
+            "图片作为视频首帧/参考上游，保持画面一致；多图时第二张可作为尾帧候选",
+        ))
     if selected and _selected_image_ready(canvas, selected):
         submit_params = dict(task)
         submit_params["model_params"] = dict(task["model_params"])
         submit_params["model_params"]["prompt"] = video_prompt
         actions.append(PlannedAction("submit_generation", {
-            "node_id": None,
+            "node_id": "$created[0]",
             "model_type": "video",
             "model_params": submit_params["model_params"],
             "estimated_cost": task["estimated_cost"],
         }, "提交视频生成（上游图片已就绪）", "上游首帧已就绪，可以立即提交；未就绪则会等唤醒后自动提交"))
+    return actions
+
+
+def _plan_media_process(
+    content: str,
+    selected: list[int],
+    tool_name: str,
+    *,
+    summary: str,
+    reasoning: str,
+    estimated_cost: int = 12,
+) -> list[PlannedAction]:
+    """扩图/超分/抽帧/剪辑：选中源节点后由工具内部派生新节点。"""
+    if not selected:
+        return [PlannedAction(
+            "get_canvas_summary", {}, "读取画布并确认加工目标",
+            "加工需要明确源节点，请先选中图片或视频后再说一次",
+        )]
+    actions: list[PlannedAction] = [
+        PlannedAction(
+            "get_node_detail", {"node_id": selected[0]}, "读取源节点完整信息",
+            "确认源节点类型、产物与参数后再派生加工",
+        ),
+        PlannedAction(
+            tool_name,
+            {
+                "node_id": selected[0],
+                "estimated_cost": estimated_cost,
+                "model_params": {"prompt": content[:200]},
+            },
+            summary,
+            reasoning,
+        ),
+    ]
     return actions
 
 
@@ -390,6 +519,35 @@ def plan(content: str, canvas: dict | None = None, selected_nodes: list[int] | N
         # 主图走 ReAct；规则 fallback 不再搭短剧空壳
         return []
 
+    if intent == "outpaint":
+        return _plan_media_process(
+            content, selected, "outpaint",
+            summary="扩图（派生新图节点）",
+            reasoning="从源图派生扩图结果，源图保留可回溯",
+            estimated_cost=12,
+        )
+    if intent == "upscale":
+        return _plan_media_process(
+            content, selected, "upscale",
+            summary="超分（派生新节点）",
+            reasoning="源与结果分离：超分写到新节点，源素材不动",
+            estimated_cost=12,
+        )
+    if intent == "extract_frames":
+        return _plan_media_process(
+            content, selected, "extract_frames",
+            summary="抽帧（派生新图节点）",
+            reasoning="从源视频派生关键帧图片，不改源视频",
+            estimated_cost=8,
+        )
+    if intent == "trim_clip":
+        return _plan_media_process(
+            content, selected, "trim_clip",
+            summary="剪辑（派生新视频节点）",
+            reasoning="从源视频派生剪辑片段，不改源视频",
+            estimated_cost=8,
+        )
+
     if intent in ("summarize", "copy", "directions"):
         actions.append(PlannedAction("get_canvas_summary", {}, "读取画布摘要"))
         return actions
@@ -413,12 +571,13 @@ def plan(content: str, canvas: dict | None = None, selected_nodes: list[int] | N
     if intent in ("create", "generate") and (
         _wants_add_to_canvas(content) or _infer_node_type(content) != "text" or intent == "generate"
     ):
-        if selected and intent == "generate" and not _wants_add_to_canvas(content):
+        # 默认：选中参考 → 新建下游 → 连线 → 提交；仅明确「重跑当前节点」时就地生成
+        if selected and intent == "generate" and _wants_inplace_regenerate(content):
             from ..domain.prompt_builder import prompt_for_media_create
 
             node_type = _infer_node_type(content)
             actions.append(PlannedAction(
-                "get_selected_nodes", {"node_ids": selected}, "读取选中节点",
+                "get_node_detail", {"node_id": selected[0]}, "读取选中节点完整信息",
                 "先确认选中节点的真实配置与状态",
             ))
             actions.append(PlannedAction("submit_generation", {
@@ -429,9 +588,9 @@ def plan(content: str, canvas: dict | None = None, selected_nodes: list[int] | N
                     "count": 1,
                 },
                 "estimated_cost": 10,
-            }, "提交生成任务", "基于选中节点直接生成，不新建节点"))
+            }, "提交生成任务", "在选中节点上就地重跑"))
             return actions
-        return _plan_create_media(content, selected)
+        return _plan_create_media(content, selected, canvas)
 
     if intent == "connect":
         actions.append(PlannedAction(

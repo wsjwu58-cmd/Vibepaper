@@ -32,7 +32,7 @@ def test_collab_tools_registered():
 
 
 def test_p2_tools_registered():
-    for name in ("extract_frames", "trim_clip", "upscale", "compose_final", "capture_3d_scene"):
+    for name in ("extract_frames", "trim_clip", "upscale", "outpaint", "compose_final", "capture_3d_scene"):
         assert name in TOOLS
         assert TOOLS[name].category == "p2"
         risk, _ = classify_risk(name, {"estimated_cost": 10, "node_id": 1}, None)

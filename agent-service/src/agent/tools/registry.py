@@ -3,7 +3,7 @@
 read：get_* / list_* / search_* / update_memory / clock / load_skill / check_task_status
 low：create_nodes / connect_nodes / layout_nodes / update_node_config
 high：delete_nodes / change_model / replace_output / submit_generation
-P2 预留：extract_frames / trim_clip / upscale / compose_final
+加工：extract_frames / trim_clip / upscale / outpaint / compose_final（默认派生新节点）
 """
 
 from __future__ import annotations
@@ -131,12 +131,130 @@ def _get_canvas_summary(canvas_id: int, user_id: int, selected_node_ids: list[in
     }
 
 
+def _fetch_canvas_detail(canvas_id: int, user_id: int) -> dict | None:
+    """拉取画布全量节点/连线（含完整 params / prompt / output）。"""
+    for path in (
+        f"{settings.canvas_base_url}/internal/canvases/{canvas_id}",
+        f"{settings.canvas_base_url}/api/v1/canvases/{canvas_id}",
+    ):
+        try:
+            r = httpx.get(path, headers=headers_for(user_id), timeout=10, trust_env=False)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            continue
+    return None
+
+
+def _neighbor_brief(node: dict | None) -> dict | None:
+    if not node:
+        return None
+    params = node.get("params") if isinstance(node.get("params"), dict) else {}
+    return {
+        "id": node.get("id"),
+        "type": node.get("type") or node.get("nodeType"),
+        "creativeType": node.get("creativeType") or node.get("creative_type"),
+        "status": node.get("status"),
+        "execStatus": node.get("execStatus") or node.get("exec_status"),
+        "title": params.get("title"),
+        "prompt": (node.get("prompt") or params.get("prompt") or "")[:120] or None,
+        "hasOutput": bool(node.get("output") or params.get("lastOutputUrl") or params.get("url")),
+    }
+
+
+def _attach_graph_neighbors(node: dict, nodes_by_id: dict[int, dict], edges: list[dict]) -> dict:
+    """为节点挂上完整字段 + 上下游连接信息。"""
+    nid = int(node.get("id"))
+    upstream: list[dict] = []
+    downstream: list[dict] = []
+    in_edges: list[dict] = []
+    out_edges: list[dict] = []
+    for e in edges:
+        src = e.get("sourceNodeId") if e.get("sourceNodeId") is not None else e.get("source")
+        tgt = e.get("targetNodeId") if e.get("targetNodeId") is not None else e.get("target")
+        try:
+            src_i, tgt_i = int(src), int(tgt)
+        except (TypeError, ValueError):
+            continue
+        dep = e.get("dependencyType") or e.get("dependency_type") or "reference"
+        edge_brief = {
+            "id": e.get("id"),
+            "sourceNodeId": src_i,
+            "targetNodeId": tgt_i,
+            "dependencyType": dep,
+            "sourcePort": e.get("sourcePort") or e.get("source_port") or "output",
+            "targetPort": e.get("targetPort") or e.get("target_port") or "input",
+            "valid": e.get("valid", True),
+        }
+        if tgt_i == nid:
+            in_edges.append(edge_brief)
+            brief = _neighbor_brief(nodes_by_id.get(src_i))
+            if brief:
+                brief = {**brief, "dependencyType": dep}
+                upstream.append(brief)
+        if src_i == nid:
+            out_edges.append(edge_brief)
+            brief = _neighbor_brief(nodes_by_id.get(tgt_i))
+            if brief:
+                brief = {**brief, "dependencyType": dep}
+                downstream.append(brief)
+    params = node.get("params") if isinstance(node.get("params"), dict) else {}
+    prompt = node.get("prompt") or params.get("prompt")
+    return {
+        "id": nid,
+        "type": node.get("type") or node.get("nodeType"),
+        "creativeType": node.get("creativeType") or node.get("creative_type"),
+        "status": node.get("status"),
+        "execStatus": node.get("execStatus") or node.get("exec_status") or "idle",
+        "stale": bool(node.get("stale")),
+        "modelRef": node.get("modelRef") or node.get("model_ref") or params.get("model"),
+        "prompt": prompt,
+        "params": params,
+        "output": node.get("output"),
+        "x": node.get("x") if node.get("x") is not None else node.get("positionX"),
+        "y": node.get("y") if node.get("y") is not None else node.get("positionY"),
+        "width": node.get("width"),
+        "height": node.get("height"),
+        "upstream": upstream,
+        "downstream": downstream,
+        "incomingEdges": in_edges,
+        "outgoingEdges": out_edges,
+    }
+
+
 def _get_selected_nodes(canvas_id: int, user_id: int, node_ids: list[int] | None = None, **ctx) -> dict:
-    summary = _get_canvas_summary(canvas_id, user_id, selected_node_ids=node_ids)
-    ids = set(int(x) for x in (node_ids or []))
-    nodes = summary.get("selectedNodes") or summary.get("nodes") or []
-    selected = [n for n in nodes if n.get("id") in ids] if ids else nodes[:20]
-    return {"selectedNodes": selected}
+    """返回选中节点的完整信息（prompt / params / output / 上下游）。"""
+    detail = _fetch_canvas_detail(canvas_id, user_id)
+    if not detail:
+        summary = _get_canvas_summary(canvas_id, user_id, selected_node_ids=node_ids)
+        ids = set(int(x) for x in (node_ids or []))
+        nodes = summary.get("selectedNodes") or summary.get("nodes") or []
+        selected = [n for n in nodes if n.get("id") in ids] if ids else nodes[:20]
+        return {"selectedNodes": selected, "detail": False}
+    nodes = list(detail.get("nodes") or [])
+    edges = list(detail.get("edges") or [])
+    nodes_by_id = {int(n["id"]): n for n in nodes if n.get("id") is not None}
+    ids = [int(x) for x in (node_ids or [])]
+    if not ids:
+        ids = list(nodes_by_id.keys())[:20]
+    selected = [
+        _attach_graph_neighbors(nodes_by_id[i], nodes_by_id, edges)
+        for i in ids
+        if i in nodes_by_id
+    ]
+    return {"selectedNodes": selected, "count": len(selected), "detail": True}
+
+
+def _get_node_detail(canvas_id: int, user_id: int, node_id: int | None = None, **ctx) -> dict:
+    """读取单个节点完整信息（提示词、参数、产物、上下游连接）。"""
+    coerced = _coerce_node_id(node_id if node_id is not None else ctx.get("nodeId"))
+    if coerced is None:
+        return {"error": "缺少 node_id", "error_code": "INVALID_INPUT"}
+    packed = _get_selected_nodes(canvas_id, user_id, node_ids=[coerced], **ctx)
+    nodes = packed.get("selectedNodes") or []
+    if not nodes:
+        return {"error": f"节点不存在: {coerced}", "error_code": "NOT_FOUND"}
+    return {"node": nodes[0], "detail": packed.get("detail", True)}
 
 
 def _list_models(model_type: str | None = None, **ctx) -> dict:
@@ -523,10 +641,14 @@ def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dic
         return {}
 
     nodes = {int(n["id"]): n for n in (detail.get("nodes") or []) if n.get("id") is not None}
-    edges = detail.get("edges") or []
+    # 按边 id 升序，保留 connect 时的首尾帧顺序
+    edges = sorted(
+        detail.get("edges") or [],
+        key=lambda e: int(e.get("id") or 0),
+    )
     ref_urls: list[str] = []
     ref_texts: list[str] = []
-    first_image: str | None = None
+    image_urls: list[str] = []
     for e in edges:
         dep = str(e.get("dependencyType") or e.get("dependency_type") or "reference").lower()
         # control 不喂内容；input/reference 都可作为参考素材
@@ -547,11 +669,8 @@ def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dic
             url = _node_media_url(src_node)
             if url:
                 ref_urls.append(url)
-                if ntype == "image" and not first_image:
-                    first_image = url
-                # 仅视频上游且尚无图片首帧时，也可作参考（非首帧优先）
-                if ntype == "video" and not first_image:
-                    pass
+                if ntype == "image":
+                    image_urls.append(url)
         elif ntype == "text":
             text = _node_text_output(src_node)
             if text:
@@ -570,10 +689,14 @@ def _collect_input_references(canvas_id: int, user_id: int, node_id: int) -> dic
         out["referenceImages"] = [u for u in out["referenceUrls"] if u]
     if ref_texts:
         out["referenceTexts"] = ref_texts
-    if first_image:
-        out["imageUrl"] = first_image
-        out["firstFrameUrl"] = first_image
-        out["image"] = first_image
+    # 按连线顺序：第一张图作首帧，第二张图作尾帧（首尾帧生视频）
+    uniq_images = list(dict.fromkeys(image_urls))
+    if uniq_images:
+        out["imageUrl"] = uniq_images[0]
+        out["firstFrameUrl"] = uniq_images[0]
+        out["image"] = uniq_images[0]
+        if len(uniq_images) >= 2:
+            out["lastFrameUrl"] = uniq_images[1]
     return out
 
 
@@ -928,27 +1051,212 @@ def _submit_media_operation(
         model_type=model_type,
         model_params=params,
         estimated_cost=estimated_cost,
+        **ctx,
     )
 
 
+def _source_node_xy(canvas_id: int, user_id: int, source_id: int) -> tuple[float, float, dict]:
+    """读取源节点坐标与摘要，派生节点落在其右侧。"""
+    packed = _get_selected_nodes(canvas_id, user_id, node_ids=[source_id])
+    nodes = packed.get("selectedNodes") or []
+    if not nodes:
+        return 520.0, 180.0, {}
+    src = nodes[0]
+    x = float(src.get("x") or 220) + 300
+    y = float(src.get("y") or 180)
+    return x, y, src
+
+
+def _derive_and_operate(
+    canvas_id: int,
+    user_id: int,
+    *,
+    source_node_id: int,
+    derived_type: str,
+    operation: str,
+    submit_model_type: str,
+    title: str,
+    prompt: str,
+    estimated_cost: int = 10,
+    model_params: dict | None = None,
+    creative_type: str | None = None,
+    inplace: bool = False,
+    **ctx,
+) -> dict:
+    """从源节点派生新节点 → 连线 → 在新节点上提交加工（默认不改源）。"""
+    coerced = _coerce_node_id(source_node_id)
+    if coerced is None:
+        return {"error": "缺少源节点 ID", "error_code": "INVALID_INPUT"}
+
+    if inplace:
+        result = _submit_media_operation(
+            canvas_id, user_id, coerced, submit_model_type, operation,
+            model_params, estimated_cost, **ctx,
+        )
+        return {**result, "derived": False, "sourceNodeId": coerced, "node_id": coerced}
+
+    x, y, src = _source_node_xy(canvas_id, user_id, coerced)
+    params = {
+        "prompt": prompt,
+        "title": title,
+        "operation": operation,
+        **(model_params or {}),
+    }
+    if derived_type == "image":
+        from ..domain.workflow_rails import IMAGE_PREF_MODEL as _img
+        params.setdefault("model", _img)
+    created = _create_nodes(
+        canvas_id,
+        user_id,
+        nodes=[{
+            "type": derived_type,
+            "x": x,
+            "y": y,
+            "params": params,
+            "prompt": prompt,
+            "creativeType": creative_type,
+            "modelRef": params.get("model"),
+        }],
+        **ctx,
+    )
+    if created.get("error"):
+        return created
+    new_nodes = created.get("createdNodes") or created.get("nodes") or []
+    if not new_nodes:
+        return {"error": "派生节点创建失败", "error_code": "CREATE_FAILED"}
+    new_id = int(new_nodes[0]["id"])
+    linked = _connect_nodes(
+        canvas_id,
+        user_id,
+        edges=[{
+            "sourceNodeId": coerced,
+            "targetNodeId": new_id,
+            "dependencyType": "input",
+        }],
+        **ctx,
+    )
+    if linked.get("error"):
+        return {**linked, "createdNodes": new_nodes, "derivedNodeId": new_id}
+
+    # 源已有产物时，把 URL 写进派生节点提交参数，避免仅靠连线时序丢参考
+    submit_params = dict(model_params or {})
+    src_params = src.get("params") if isinstance(src.get("params"), dict) else {}
+    src_out = src.get("output") if isinstance(src.get("output"), dict) else {}
+    src_url = (
+        src_out.get("url")
+        or src_params.get("lastOutputUrl")
+        or src_params.get("url")
+        or src_params.get("thumbnailUrl")
+    )
+    if src_url:
+        submit_params.setdefault("sourceUrl", src_url)
+        submit_params.setdefault("referenceUrls", [src_url])
+        if derived_type == "image" or submit_model_type == "image":
+            submit_params.setdefault("imageUrl", src_url)
+            submit_params.setdefault("image", src_url)
+            submit_params.setdefault("referenceImages", [src_url])
+
+    result = _submit_media_operation(
+        canvas_id, user_id, new_id, submit_model_type, operation,
+        submit_params, estimated_cost, **ctx,
+    )
+    return {
+        **result,
+        "derived": True,
+        "sourceNodeId": coerced,
+        "derivedNodeId": new_id,
+        "createdNodes": new_nodes,
+        "createdEdges": linked.get("createdEdges"),
+        "operation": operation,
+    }
+
+
 def _extract_frames(canvas_id: int, user_id: int, node_id: int, model_params: dict | None = None,
-                    estimated_cost: int = 8, **ctx) -> dict:
-    return _submit_media_operation(
-        canvas_id, user_id, node_id, "video", "提帧", model_params, estimated_cost, **ctx,
+                    estimated_cost: int = 8, inplace: bool = False, **ctx) -> dict:
+    """视频抽帧：默认派生 image 节点，不改源视频。"""
+    return _derive_and_operate(
+        canvas_id,
+        user_id,
+        source_node_id=node_id,
+        derived_type="image",
+        operation="提帧",
+        submit_model_type="video",
+        title="抽帧",
+        prompt=str((model_params or {}).get("prompt") or "提取关键帧"),
+        estimated_cost=estimated_cost,
+        model_params=model_params,
+        creative_type="keyframe",
+        inplace=inplace,
+        **ctx,
     )
 
 
 def _trim_clip(canvas_id: int, user_id: int, node_id: int, model_params: dict | None = None,
-               estimated_cost: int = 8, **ctx) -> dict:
-    return _submit_media_operation(
-        canvas_id, user_id, node_id, "video", "剪辑", model_params, estimated_cost, **ctx,
+               estimated_cost: int = 8, inplace: bool = False, **ctx) -> dict:
+    """片段剪辑：默认派生 video 节点，不改源视频。"""
+    return _derive_and_operate(
+        canvas_id,
+        user_id,
+        source_node_id=node_id,
+        derived_type="video",
+        operation="剪辑",
+        submit_model_type="video",
+        title="剪辑片段",
+        prompt=str((model_params or {}).get("prompt") or "剪辑片段"),
+        estimated_cost=estimated_cost,
+        model_params=model_params,
+        creative_type="clip",
+        inplace=inplace,
+        **ctx,
     )
 
 
-def _upscale(canvas_id: int, user_id: int, node_id: int, model_type: str = "image",
-             model_params: dict | None = None, estimated_cost: int = 12, **ctx) -> dict:
-    return _submit_media_operation(
-        canvas_id, user_id, node_id, model_type, "超分", model_params, estimated_cost, **ctx,
+def _upscale(canvas_id: int, user_id: int, node_id: int, model_type: str | None = None,
+             model_params: dict | None = None, estimated_cost: int = 12,
+             inplace: bool = False, **ctx) -> dict:
+    """超分：默认派生同类型节点，不改源素材。"""
+    coerced = _coerce_node_id(node_id)
+    if coerced is None:
+        return {"error": "缺少源节点 ID", "error_code": "INVALID_INPUT"}
+    _, _, src = _source_node_xy(canvas_id, user_id, coerced)
+    src_type = str(src.get("type") or model_type or "image").lower()
+    if src_type not in ("image", "video"):
+        src_type = "image" if str(model_type or "image").lower() != "video" else "video"
+    submit_type = model_type or src_type
+    return _derive_and_operate(
+        canvas_id,
+        user_id,
+        source_node_id=coerced,
+        derived_type=src_type,
+        operation="超分",
+        submit_model_type=submit_type,
+        title="超分",
+        prompt=str((model_params or {}).get("prompt") or "提升清晰度与细节"),
+        estimated_cost=estimated_cost,
+        model_params=model_params,
+        creative_type=src.get("creativeType"),
+        inplace=inplace,
+        **ctx,
+    )
+
+
+def _outpaint(canvas_id: int, user_id: int, node_id: int, model_params: dict | None = None,
+              estimated_cost: int = 12, inplace: bool = False, **ctx) -> dict:
+    """扩图（outpaint）：默认派生 image 节点，不改源图。"""
+    return _derive_and_operate(
+        canvas_id,
+        user_id,
+        source_node_id=node_id,
+        derived_type="image",
+        operation="扩图",
+        submit_model_type="image",
+        title="扩图",
+        prompt=str((model_params or {}).get("prompt") or "扩展画面边缘，保持主体完整"),
+        estimated_cost=estimated_cost,
+        model_params=model_params,
+        creative_type="keyframe",
+        inplace=inplace,
+        **ctx,
     )
 
 
@@ -986,7 +1294,8 @@ def _p2_reserved(**ctx) -> dict:
 
 TOOLS: dict[str, Tool] = {
     "get_canvas_summary": Tool("get_canvas_summary", "读取画布摘要", "read", _get_canvas_summary),
-    "get_selected_nodes": Tool("get_selected_nodes", "读取选中节点", "read", _get_selected_nodes),
+    "get_selected_nodes": Tool("get_selected_nodes", "读取选中节点完整信息", "read", _get_selected_nodes),
+    "get_node_detail": Tool("get_node_detail", "读取单节点完整信息（prompt/params/output/上下游）", "read", _get_node_detail),
     "list_models": Tool("list_models", "列出可用模型", "read", _list_models),
     "search_assets": Tool("search_assets", "搜索素材库", "read", _search_assets),
     "create_nodes": Tool("create_nodes", "创建节点（单次 ≤20 免确认）", "low", _create_nodes),
@@ -1002,10 +1311,11 @@ TOOLS: dict[str, Tool] = {
     "clock": Tool("clock", "注册定时唤醒", "read", _clock, category="collab"),
     "load_skill": Tool("load_skill", "按需加载 Skill 规则", "read", _load_skill, category="collab"),
     "check_task_status": Tool("check_task_status", "查询生成任务状态", "read", _check_task_status, category="collab"),
-    # P2 创作工具（经 billing 任务 + operation）
-    "extract_frames": Tool("extract_frames", "视频抽帧", "high", _extract_frames, category="p2"),
-    "trim_clip": Tool("trim_clip", "片段剪辑", "high", _trim_clip, category="p2"),
-    "upscale": Tool("upscale", "素材超分", "high", _upscale, category="p2"),
+    # 素材加工（默认派生新节点，不改源）
+    "extract_frames": Tool("extract_frames", "视频抽帧（派生新图节点）", "high", _extract_frames, category="p2"),
+    "trim_clip": Tool("trim_clip", "片段剪辑（派生新视频节点）", "high", _trim_clip, category="p2"),
+    "upscale": Tool("upscale", "素材超分（派生新节点）", "high", _upscale, category="p2"),
+    "outpaint": Tool("outpaint", "扩图 outpaint（派生新图节点）", "high", _outpaint, category="p2"),
     "compose_final": Tool("compose_final", "拼接成片", "high", _compose_final, category="p2"),
     "capture_3d_scene": Tool("capture_3d_scene", "3D 导演台截图", "high", _capture_3d_scene, category="p2"),
 }

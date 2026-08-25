@@ -133,7 +133,7 @@ def validate_action(action: dict, canvas_context: dict | None) -> str | None:
     tool = action.get("tool_name") or action.get("tool")
     params = action.get("params") or {}
     exec_tools = {
-        "submit_generation", "extract_frames", "trim_clip", "upscale",
+        "submit_generation", "extract_frames", "trim_clip", "upscale", "outpaint",
         "compose_final", "capture_3d_scene",
     }
     if tool in exec_tools:

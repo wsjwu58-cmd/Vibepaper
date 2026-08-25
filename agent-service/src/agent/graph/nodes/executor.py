@@ -19,7 +19,7 @@ from .risk_classifier import _next_id
 logger = logging.getLogger("agent.graph.executor")
 
 EXEC_TOOLS = {
-    "submit_generation", "extract_frames", "trim_clip", "upscale", "compose_final", "capture_3d_scene",
+    "submit_generation", "extract_frames", "trim_clip", "upscale", "outpaint", "compose_final", "capture_3d_scene",
 }
 
 

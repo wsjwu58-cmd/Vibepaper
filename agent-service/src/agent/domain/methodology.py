@@ -101,7 +101,7 @@ def _input_edges(actions: list[Any]) -> list[dict]:
 
 
 def _submits(actions: list[Any]) -> list[Any]:
-    return [a for a in actions if _tool(a) in ("submit_generation", "compose_final", "upscale")]
+    return [a for a in actions if _tool(a) in ("submit_generation", "compose_final", "upscale", "outpaint", "extract_frames", "trim_clip")]
 
 
 def _node_prompt(node: dict) -> str:

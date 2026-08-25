@@ -313,6 +313,7 @@ def create_plan_node(state: AgentState) -> dict:
         project_memories=state.get("project_memories"),
         long_term_prefs=state.get("long_term_prefs"),
         observations=state.get("observations"),
+        selected_nodes=list(state.get("selected_nodes") or []),
     )
     new_events: list[dict[str, Any]] = []
     if plan.thinking:

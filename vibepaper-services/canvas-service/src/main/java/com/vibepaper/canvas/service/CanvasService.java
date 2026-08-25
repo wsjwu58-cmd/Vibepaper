@@ -594,9 +594,72 @@ public class CanvasService {
             return m;
         }).toList();
 
-        List<Map<String, Object>> selectedBriefs = nodeBriefs.stream()
-                .filter(m -> selected.contains(((Number) m.get("id")).longValue()))
-                .toList();
+        List<Map<String, Object>> selectedBriefs = nodes.stream()
+                .filter(n -> selected.contains(n.getId()))
+                .map(n -> {
+                    // 选中节点给 Agent 完整可读信息（prompt / params / output / 邻居）
+                    Map<String, Object> m = new HashMap<>();
+                    CanvasDtos.NodePayload full = toNodePayload(n);
+                    m.put("id", full.id());
+                    m.put("type", full.type());
+                    m.put("status", full.status());
+                    m.put("creativeType", full.creativeType());
+                    m.put("stale", Boolean.TRUE.equals(full.stale()));
+                    m.put("modelRef", full.modelRef());
+                    m.put("execStatus", full.execStatus() == null ? "idle" : full.execStatus());
+                    m.put("prompt", full.prompt());
+                    m.put("params", full.params() == null ? Map.of() : full.params());
+                    m.put("output", full.output());
+                    m.put("x", full.x());
+                    m.put("y", full.y());
+                    m.put("width", full.width());
+                    m.put("height", full.height());
+                    List<Map<String, Object>> upstream = new ArrayList<>();
+                    List<Map<String, Object>> downstream = new ArrayList<>();
+                    List<Map<String, Object>> inEdges = new ArrayList<>();
+                    List<Map<String, Object>> outEdges = new ArrayList<>();
+                    for (CanvasEdge e : edges) {
+                        Map<String, Object> eb = new HashMap<>();
+                        eb.put("id", e.getId());
+                        eb.put("sourceNodeId", e.getSourceNodeId());
+                        eb.put("targetNodeId", e.getTargetNodeId());
+                        eb.put("dependencyType", e.getDependencyType() == null ? "reference" : e.getDependencyType());
+                        eb.put("valid", e.getValid());
+                        if (e.getTargetNodeId().equals(n.getId())) {
+                            inEdges.add(eb);
+                            CanvasNode src = nodes.stream().filter(x -> x.getId().equals(e.getSourceNodeId())).findFirst().orElse(null);
+                            if (src != null) {
+                                Map<String, Object> nb = new HashMap<>();
+                                nb.put("id", src.getId());
+                                nb.put("type", src.getNodeType());
+                                nb.put("creativeType", src.getCreativeType());
+                                nb.put("status", src.getStatus());
+                                nb.put("dependencyType", eb.get("dependencyType"));
+                                upstream.add(nb);
+                            }
+                        }
+                        if (e.getSourceNodeId().equals(n.getId())) {
+                            outEdges.add(eb);
+                            CanvasNode tgt = nodes.stream().filter(x -> x.getId().equals(e.getTargetNodeId())).findFirst().orElse(null);
+                            if (tgt != null) {
+                                Map<String, Object> nb = new HashMap<>();
+                                nb.put("id", tgt.getId());
+                                nb.put("type", tgt.getNodeType());
+                                nb.put("creativeType", tgt.getCreativeType());
+                                nb.put("status", tgt.getStatus());
+                                nb.put("dependencyType", eb.get("dependencyType"));
+                                downstream.add(nb);
+                            }
+                        }
+                    }
+                    m.put("upstream", upstream);
+                    m.put("downstream", downstream);
+                    m.put("incomingEdges", inEdges);
+                    m.put("outgoingEdges", outEdges);
+                    boolean hasOutput = full.output() != null && !full.output().isEmpty();
+                    m.put("hasOutput", hasOutput);
+                    return m;
+                }).toList();
         List<Map<String, Object>> relatedBriefs = nodeBriefs.stream()
                 .filter(m -> relatedIds.contains(((Number) m.get("id")).longValue()))
                 .toList();

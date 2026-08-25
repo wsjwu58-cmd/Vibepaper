@@ -62,13 +62,14 @@ _READ_PREFIXES = ("get_", "list_", "search_", "check_", "load_")
 _WRITE_TOOLS = frozenset({
     "create_nodes", "connect_nodes", "layout_nodes", "update_node_config",
     "delete_nodes", "change_model", "replace_output", "submit_generation",
-    "extract_frames", "trim_clip", "upscale", "compose_final", "capture_3d_scene",
+    "extract_frames", "trim_clip", "upscale", "outpaint", "compose_final", "capture_3d_scene",
     "update_memory", "clock",
 })
 
 _EXEC_INTENTS = frozenset({
     "create", "generate", "delete", "update", "connect", "layout", "model",
     "search", "advance_pipeline", "reregenerate_stale", "orchestrate_workflow",
+    "outpaint", "upscale", "extract_frames", "trim_clip",
 })
 
 _PAPER_READ = frozenset({"summarize", "copy", "directions"})

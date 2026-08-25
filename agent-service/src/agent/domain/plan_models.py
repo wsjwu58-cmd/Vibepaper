@@ -132,7 +132,7 @@ def _looks_like_action(item: dict[str, Any]) -> bool:
     return t in {
         "create_node", "create_nodes", "connect_nodes", "update_node_config",
         "layout_nodes", "delete_nodes", "submit_generation", "compose_final",
-        "load_skill", "extract_frames", "trim_clip",
+        "load_skill", "extract_frames", "trim_clip", "upscale", "outpaint",
     }
 
 

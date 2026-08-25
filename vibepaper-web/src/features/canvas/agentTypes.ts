@@ -40,6 +40,7 @@ export interface AgentChatMsg {
   export const TOOL_LABELS: Record<string, string> = {
     get_canvas_summary: '读取资源',
     get_selected_nodes: '读取资源',
+    get_node_detail: '读取资源',
     get_all_nodes: '读取资源',
     list_models: '查询模型',
     search_assets: '查询资源',
@@ -58,6 +59,7 @@ export interface AgentChatMsg {
     extract_frames: '抽帧',
     trim_clip: '裁剪片段',
     upscale: '超分',
+    outpaint: '扩图',
     compose_final: '合成成片',
     capture_3d_scene: '导演台捕获',
     // P0 能力门面（若 SSE 直接透出 operation）

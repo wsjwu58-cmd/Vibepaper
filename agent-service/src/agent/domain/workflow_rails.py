@@ -303,7 +303,7 @@ def action_route_hint(tool: str) -> str:
     if tool.startswith(("get_", "list_", "search_", "check_")):
         return "read"
     if tool in {
-        "submit_generation", "extract_frames", "trim_clip", "upscale",
+        "submit_generation", "extract_frames", "trim_clip", "upscale", "outpaint",
         "compose_final", "capture_3d_scene",
     }:
         return "exec"

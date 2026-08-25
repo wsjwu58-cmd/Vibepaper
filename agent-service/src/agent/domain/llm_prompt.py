@@ -154,7 +154,35 @@ def _canvas_brief(canvas_context: dict[str, Any] | None) -> dict[str, Any]:
         "name", "nodeCount", "edgeCount", "nodeTypeCounts", "creativeTypeCounts",
         "keywords", "staleNodes", "pipelineHint", "inputChains", "targetContext",
     )
-    return {k: ctx.get(k) for k in keys if k in ctx}
+    out = {k: ctx.get(k) for k in keys if k in ctx}
+    # 选中节点完整信息（prompt/params/上下游）供模型接地
+    selected = ctx.get("selectedNodes")
+    if isinstance(selected, list) and selected:
+        briefs = []
+        for n in selected[:6]:
+            if not isinstance(n, dict):
+                continue
+            params = n.get("params") if isinstance(n.get("params"), dict) else {}
+            briefs.append({
+                "id": n.get("id"),
+                "type": n.get("type"),
+                "creativeType": n.get("creativeType"),
+                "status": n.get("status") or n.get("execStatus"),
+                "prompt": (n.get("prompt") or params.get("prompt") or "")[:400] or None,
+                "title": params.get("title"),
+                "modelRef": n.get("modelRef") or params.get("model"),
+                "params": {
+                    k: params.get(k)
+                    for k in ("model", "aspect", "ratio", "duration", "resolution", "count")
+                    if params.get(k) is not None
+                } or None,
+                "hasOutput": bool(n.get("output") or n.get("hasOutput") or params.get("lastOutputUrl")),
+                "upstream": (n.get("upstream") or [])[:4],
+                "downstream": (n.get("downstream") or [])[:4],
+            })
+        if briefs:
+            out["selectedNodes"] = briefs
+    return out
 
 
 def _observations_brief(observations: list[dict[str, Any]] | None, limit: int = 10) -> list[dict[str, Any]]:
@@ -298,7 +326,12 @@ def build_user_prompt(
         sections.append(_brief_json(canvas, 1600))
 
     if selected_nodes:
-        sections.append(f"【选中节点】{selected_nodes}")
+        sections.append(f"【选中节点 ID】{selected_nodes}")
+        # 若画布摘要已带完整选中信息，提示模型以 selectedNodes 为准派生
+        sel_detail = (canvas_context or {}).get("selectedNodes") if isinstance(canvas_context, dict) else None
+        if isinstance(sel_detail, list) and sel_detail:
+            sections.append("【选中节点完整信息｜派生新节点时须 connect input，禁止只在原节点硬提】")
+            sections.append(_brief_json(sel_detail[:6], 2400))
 
     if loaded_skill_keys:
         sections.append(f"【已加载 Skill keys】{loaded_skill_keys}")

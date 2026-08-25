@@ -25,11 +25,11 @@ logger = logging.getLogger("agent.graph.react_agent")
 DEFAULT_MAX_REACT_STEPS = 8
 
 _ALLOWED_TOOLS = frozenset({
-    "get_canvas_summary", "get_selected_nodes", "list_models", "search_assets",
+    "get_canvas_summary", "get_selected_nodes", "get_node_detail", "list_models", "search_assets",
     "load_skill", "check_task_status",
     "create_nodes", "connect_nodes", "layout_nodes", "update_node_config",
     "delete_nodes", "change_model", "replace_output",
-    "submit_generation", "compose_final", "extract_frames", "trim_clip", "upscale",
+    "submit_generation", "compose_final", "extract_frames", "trim_clip", "upscale", "outpaint",
 })
 
 
@@ -42,7 +42,7 @@ def _tool_kind(tool: str) -> str:
         return "load_skill"
     if tool.startswith(("get_", "list_", "search_", "check_")):
         return "read"
-    if tool in ("submit_generation", "compose_final", "extract_frames", "trim_clip", "upscale"):
+    if tool in ("submit_generation", "compose_final", "extract_frames", "trim_clip", "upscale", "outpaint"):
         return "exec"
     return "edit"
 
@@ -108,6 +108,7 @@ def _rails_shortcut(state: AgentState) -> StructuredPlan | None:
             requested_skill=intent.get("requested_skill"),
             creative={"thinking": "铁路：推进/重跑"},
             canvas_context=ctx,
+            selected_nodes=list(state.get("selected_nodes") or []),
         )
     if canvas_has_workflow(ctx) and not wants_rebuild_workflow(content):
         if wants_direct_compose(content) or ("合成" in content and "短剧" not in content):
@@ -117,15 +118,16 @@ def _rails_shortcut(state: AgentState) -> StructuredPlan | None:
                 requested_skill=None,
                 creative={"thinking": "铁路：直接合成"},
                 canvas_context=ctx,
+                selected_nodes=list(state.get("selected_nodes") or []),
             )
     return None
 
 
-def _fallback_narrow_actions(content: str, canvas: dict | None) -> list[dict[str, Any]]:
+def _fallback_narrow_actions(content: str, canvas: dict | None, selected: list[int] | None = None) -> list[dict[str, Any]]:
     """无 LLM 时的窄降级：单点媒体 / 图→视频，不搭短剧空壳。"""
     from ...agent.planner import plan as rule_plan
 
-    actions = rule_plan(content, canvas or {}, [])
+    actions = rule_plan(content, canvas or {}, selected or [])
     # 拦截整包短剧脚手架
     creates = [a for a in actions if a.tool_name == "create_nodes"]
     total_nodes = sum(len((a.params or {}).get("nodes") or []) for a in creates)
@@ -199,9 +201,10 @@ def _call_react_llm(
         "2. 判断目标是否已达成；未达成则拆出本拍唯一优先动作。\n"
         "3. 若 Observation 失败：分析原因，改参数/换工具/先 get_canvas_summary，禁止重复盲试同一错误。\n"
         "—— Action（actions 字段）——\n"
-        "- 外部接地优先：缺画布事实 → get_canvas_summary / get_selected_nodes；缺规则 → load_skill。\n"
+        "- 外部接地优先：缺画布事实 → get_canvas_summary / get_selected_nodes / get_node_detail；缺规则 → load_skill。\n"
+        "- 有选中参考要派生新图/视频：create_nodes → connect_nodes(input) → submit_generation($created[0])，禁止只在原节点上硬提。\n"
         "- 再 edit：create_nodes / connect_nodes / update_node_config / layout_nodes。\n"
-        "- 再 exec：submit_generation / compose_final / extract_frames / trim_clip（仅依赖已就绪）。\n"
+        "- 再 exec：submit_generation / compose_final / extract_frames / trim_clip / upscale / outpaint（加工默认派生新节点，不改源）。\n"
         "- 本拍 0–3 个工具；decision=act 表示执行后还要继续观察再想。\n"
         "- 用户已选定风格/方案后：必须 act + create_nodes，禁止口头承诺空 actions / 仅 load_skill 就 finish。\n"
         "- 禁止空模板壳；禁止编造分辨率/时长/模型名；禁止整段复制用户原话进 prompt。\n"
@@ -343,6 +346,7 @@ def _structured_workflow_fallback(state: AgentState) -> StructuredPlan | None:
             project_memories=list(state.get("project_memories") or []),
             long_term_prefs=list(state.get("long_term_prefs") or []),
             observations=list(state.get("observations") or []),
+            selected_nodes=list(state.get("selected_nodes") or []),
         )
         if plan and plan.steps:
             return plan
@@ -462,14 +466,14 @@ def react_agent_node(state: AgentState) -> dict:
                 "thinking": f"模型输出解析失败：{str(exc)[:80]}",
                 "decision": "act",
                 "reply": "",
-                "actions": _fallback_narrow_actions(content, ctx),
+                "actions": _fallback_narrow_actions(content, ctx, list(state.get("selected_nodes") or [])),
             }
     else:
         data = {
             "thinking": "无 LLM：窄规则降级",
             "decision": "act",
             "reply": "",
-            "actions": _fallback_narrow_actions(content, ctx),
+            "actions": _fallback_narrow_actions(content, ctx, list(state.get("selected_nodes") or [])),
         }
 
     decision = str(data.get("decision") or "act").strip().lower()
@@ -499,7 +503,7 @@ def react_agent_node(state: AgentState) -> dict:
 
     # 仅 load_skill/只读却 finish → 强制再拍，否则加载完就停、画布零改动
     prep_only = bool(actions_raw) and all(
-        _tool_name(a) in ("load_skill", "get_canvas_summary", "get_selected_nodes", "list_models")
+        _tool_name(a) in ("load_skill", "get_canvas_summary", "get_selected_nodes", "get_node_detail", "list_models")
         for a in actions_raw
         if isinstance(a, dict)
     )
