@@ -51,6 +51,7 @@ def test_react_json_fail_falls_back_to_workflow(monkeypatch):
         reply="开始搭建",
         thinking="兜底",
     )
+    monkeypatch.setattr(ra.settings, "llm_api_key", "test-key")
     monkeypatch.setattr(ra, "_call_react_llm", boom)
     monkeypatch.setattr(ra, "_structured_workflow_fallback", lambda state: fb)
     out = ra.react_agent_node({
