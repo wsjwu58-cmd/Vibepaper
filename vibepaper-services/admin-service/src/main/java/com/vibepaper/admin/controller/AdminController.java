@@ -166,4 +166,19 @@ public class AdminController {
                 benefits,
                 body.get("enabled") == null ? true : (Boolean) body.get("enabled"));
     }
+
+    // ---- 素材治理 ----
+    @GetMapping("/api/v1/admin/assets")
+    public PageResult<Map<String, Object>> assets(@RequestParam(defaultValue = "1") int page,
+                                                  @RequestParam(defaultValue = "20") int pageSize,
+                                                  @RequestParam(required = false) String type,
+                                                  @RequestParam(required = false) String keyword,
+                                                  @RequestParam(required = false) String status) {
+        return adminService.listAssets(page, pageSize, type, keyword, status);
+    }
+
+    @PostMapping("/api/v1/admin/assets/{assetId}/moderate")
+    public Map<String, Object> moderateAsset(@PathVariable Long assetId, @RequestBody Map<String, String> body) {
+        return adminService.moderateAsset(assetId, body == null ? null : body.get("action"));
+    }
 }

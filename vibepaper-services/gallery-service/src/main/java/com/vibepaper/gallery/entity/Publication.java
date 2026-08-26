@@ -15,10 +15,16 @@ public class Publication {
     private Long canvasId;
     private Long ownerId;
     private String title;
+    private String description;
+    /** JSON array of tag strings */
+    private String tags;
     /** pending / published / rejected / taken_down */
     private String status;
     private String thumbnailUrl;
     private String previewAssetUrl;
+    /** JSON array of result asset URLs */
+    private String resultAssetUrls;
+    private Long viewCount;
     private String rejectedReason;
     private OffsetDateTime publishedAt;
     private OffsetDateTime createdAt;

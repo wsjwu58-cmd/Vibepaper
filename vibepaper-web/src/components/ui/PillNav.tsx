@@ -1,4 +1,4 @@
-import { NavLink, useNavigate } from 'react-router-dom'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { LayoutGrid, Clock, Compass, User, Building2, ShieldCheck, LogOut } from 'lucide-react'
 import { useAuth } from '@/lib/auth'
 import { cn } from '@/lib/cn'
@@ -14,7 +14,9 @@ export function PillNav() {
   const user = useAuth((s) => s.user)
   const logout = useAuth((s) => s.logout)
   const navigate = useNavigate()
+  const location = useLocation()
   const isAdmin = user && (user.role === 'ops_admin' || user.role === 'super_admin')
+  const adminActive = location.pathname.startsWith('/admin')
 
   return (
     <nav className="mx-auto flex w-fit max-w-[calc(100vw-1.5rem)] items-center gap-1 rounded-full border border-black/[0.05] bg-white px-1.5 py-1.5 shadow-[0_8px_28px_rgba(15,23,42,0.08)]">
@@ -51,11 +53,11 @@ export function PillNav() {
       </NavLink>
       {isAdmin ? (
         <NavLink
-          to="/admin"
-          className={({ isActive }) =>
+          to="/admin/dashboard"
+          className={() =>
             cn(
               'inline-flex h-10 items-center gap-2 rounded-full px-3 text-[13px] font-semibold transition',
-              isActive
+              adminActive
                 ? 'bg-[#111111] text-white [&_svg]:stroke-white'
                 : 'text-[#888] hover:bg-black/[0.04] hover:text-[#111]',
             )

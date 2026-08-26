@@ -1,14 +1,20 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/Button'
 import { Field, Input } from '@/components/ui/Input'
 import { toastError } from '@/components/ui/Toast'
 import { AuthShell } from './AuthShell'
 
+function safeRedirect(raw: string | null): string {
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return '/workspace'
+  return raw
+}
+
 export function LoginPage() {
   const login = useAuth((s) => s.login)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [account, setAccount] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -18,7 +24,7 @@ export function LoginPage() {
     setBusy(true)
     try {
       await login(account, password)
-      navigate('/workspace')
+      navigate(safeRedirect(searchParams.get('redirect')))
     } catch (err) {
       toastError(err instanceof Error ? err.message : '登录失败')
     } finally {

@@ -34,4 +34,19 @@ public class InternalController {
     public List<AssetDtos.AssetView> enterpriseAssets(@PathVariable Long enterpriseId) {
         return assetService.searchAssets(null, null, enterpriseId).stream().map(assetService::toView).toList();
     }
+
+    @GetMapping("/assets/admin")
+    public com.vibepaper.common.api.PageResult<AssetDtos.AssetView> adminList(
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int pageSize,
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String status) {
+        return assetService.adminList(page, pageSize, type, keyword, status);
+    }
+
+    @PostMapping("/assets/{assetId}/moderate")
+    public AssetDtos.AssetView moderate(@PathVariable Long assetId, @RequestBody Map<String, String> body) {
+        return assetService.adminModerate(assetId, body == null ? null : body.get("action"));
+    }
 }

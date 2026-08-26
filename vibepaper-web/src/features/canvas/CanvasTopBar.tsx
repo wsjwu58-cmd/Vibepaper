@@ -7,7 +7,6 @@ import {
   Gift,
   HelpCircle,
   Library,
-  Link,
   Megaphone,
   Share2,
   Undo2,
@@ -21,12 +20,13 @@ import { sid } from '@/lib/ids'
 import { useAuth } from '@/lib/auth'
 import { useCanvasStore } from './canvasStore'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
-import { Modal } from '@/components/ui/Modal'
 import { cn } from '@/lib/cn'
+import { ShareCanvasModal } from './share/ShareCanvasModal'
 
 export function CanvasTopBar() {
   const nav = useNavigate()
   const canvas = useCanvasStore((s) => s.canvas)
+  const setCanvas = useCanvasStore((s) => s.setCanvas)
   const saving = useCanvasStore((s) => s.saving)
   const dirty = useCanvasStore((s) => s.dirty)
   const setAssetOpen = useCanvasStore((s) => s.setAssetOpen)
@@ -96,45 +96,8 @@ export function CanvasTopBar() {
     reader.readAsText(file)
   }
 
-  const onShare = async (visibility: string) => {
-    if (!canvas) return
-    try {
-      const d = await api<{ canvas: { shareToken: string; visibility: string } }>(
-        `/canvases/${sid(canvas.canvas.id)}/share`,
-        { method: 'POST', body: JSON.stringify({ visibility }) },
-      )
-      toastSuccess(`共享状态：${visibility}`)
-      if (visibility === 'link' || visibility === 'public') {
-        void navigator.clipboard?.writeText(
-          `${location.origin}/canvas/shared/${d.canvas.shareToken}`,
-        )
-      }
-      setShareOpen(false)
-    } catch (e) {
-      toastError((e as Error).message)
-    }
-  }
-
-  const onPublish = async () => {
-    if (!canvas) return
-    try {
-      await api('/publications', {
-        method: 'POST',
-        body: JSON.stringify({
-          canvasId: canvas.canvas.id,
-          title: canvas.canvas.name,
-        }),
-      })
-      toastSuccess('已提交创意广场，等待审核')
-      setShareOpen(false)
-    } catch (e) {
-      toastError((e as Error).message)
-    }
-  }
-
   return (
     <>
-      {/* Left: dark canvas title pill */}
       <div className="pointer-events-auto absolute left-4 top-4 z-30">
         <div className="flex h-11 items-center gap-2 rounded-[18px] bg-[#1a1a1b] px-1.5 shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
           <button
@@ -164,7 +127,6 @@ export function CanvasTopBar() {
         </div>
       </div>
 
-      {/* Right: light action pill */}
       <div
         className={`pointer-events-auto absolute top-4 z-30 flex items-center gap-2 transition-[right] ${rightOffset}`}
       >
@@ -193,79 +155,36 @@ export function CanvasTopBar() {
 
           <div className="mx-1 h-5 w-px bg-black/8" />
 
-          <TopIconButton
-            title="Agent"
-            active={agentOpen}
-            onClick={() => setAgentOpen(!agentOpen)}
-          >
+          <TopIconButton title="Agent" active={agentOpen} onClick={() => setAgentOpen(!agentOpen)}>
             <Bot size={17} />
           </TopIconButton>
-          <TopIconButton
-            title="素材库"
-            active={assetOpen}
-            onClick={() => setAssetOpen(!assetOpen)}
-          >
+          <TopIconButton title="素材库" active={assetOpen} onClick={() => setAssetOpen(!assetOpen)}>
             <Library size={17} />
           </TopIconButton>
-
           <TopIconButton title="分享与发布" onClick={() => setShareOpen(true)}>
             <Share2 size={17} />
           </TopIconButton>
 
-          <Modal open={shareOpen} onClose={() => setShareOpen(false)} hideHeader>
-            <div className="flex flex-col items-center py-2 text-center">
-              <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-[#f3f4f6]">
-                <Share2 size={24} className="text-[#111]" />
-              </div>
-              <h2 className="text-[22px] font-bold text-[#111827]">分享画布</h2>
-              <p className="mb-6 text-[14px] text-[#6b7280]">选择共享方式，让他人查看或协作你的创作</p>
-
-              <div className="w-full space-y-3">
-                {(
-                  [
-                    ['private', '私密', '仅自己可见'],
-                    ['link', '仅链接', '任何获得链接的人可查看'],
-                    ['public', '公开', '在创意广场展示'],
-                  ] as const
-                ).map(([v, title, desc]) => (
-                  <button
-                    key={v}
-                    type="button"
-                    onClick={() => void onShare(v)}
-                    className={cn(
-                      'flex w-full items-center gap-4 rounded-[20px] border p-4 text-left transition hover:border-[#111]/30',
-                      canvas?.canvas.visibility === v
-                        ? 'border-[#111] bg-[#fafafa]'
-                        : 'border-[#f3f4f6] bg-white',
-                    )}
-                  >
-                    <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#f3f4f6]">
-                      {v === 'private' ? (
-                        <span className="text-[16px]">🔒</span>
-                      ) : v === 'link' ? (
-                        <Link size={18} className="text-[#666]" />
-                      ) : (
-                        <span className="text-[16px]">🌐</span>
-                      )}
-                    </span>
-                    <div className="flex-1">
-                      <p className="text-[16px] font-bold text-[#111827]">{title}</p>
-                      <p className="text-[13px] text-[#6b7280]">{desc}</p>
-                    </div>
-                    {canvas?.canvas.visibility === v && <Check size={18} className="text-[#111]" />}
-                  </button>
-                ))}
-
-                <button
-                  type="button"
-                  onClick={() => void onPublish()}
-                  className="mt-2 flex w-full items-center justify-center gap-2 rounded-[20px] bg-[#111] py-3 text-[14px] font-bold text-white"
-                >
-                  <Share2 size={16} /> 上传到创意广场
-                </button>
-              </div>
-            </div>
-          </Modal>
+          {canvas ? (
+            <ShareCanvasModal
+              open={shareOpen}
+              onClose={() => setShareOpen(false)}
+              canvasId={canvas.canvas.id}
+              canvasName={canvas.canvas.name}
+              visibility={canvas.canvas.visibility}
+              shareToken={canvas.canvas.shareToken}
+              onShareMeta={(next) => {
+                setCanvas({
+                  ...canvas,
+                  canvas: {
+                    ...canvas.canvas,
+                    visibility: next.visibility,
+                    shareToken: next.shareToken ?? canvas.canvas.shareToken,
+                  },
+                })
+              }}
+            />
+          ) : null}
 
           <input
             ref={fileRef}
@@ -347,9 +266,7 @@ function TopIconButton({
       title={title}
       className={cn(
         'rounded-full p-2 transition',
-        active
-          ? 'bg-[#111] text-white'
-          : 'text-[#666] hover:bg-black/5 hover:text-[#111]',
+        active ? 'bg-[#111] text-white' : 'text-[#666] hover:bg-black/5 hover:text-[#111]',
       )}
     >
       {children}

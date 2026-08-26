@@ -38,6 +38,7 @@ public class AdminService {
     private final BillingAdminClient billingClient;
     private final GenerationAdminClient generationClient;
     private final CanvasAdminClient canvasClient;
+    private final AssetAdminClient assetClient;
 
     public Map<String, Object> listUsers(String keyword, String status, int page, int pageSize) {
         requireAdmin();
@@ -335,6 +336,20 @@ public class AdminService {
         event.setPayload(writeJson(payload));
         event.setCreatedAt(OffsetDateTime.now());
         analyticsMapper.insert(event);
+    }
+
+    public PageResult<Map<String, Object>> listAssets(int page, int pageSize, String type, String keyword, String status) {
+        requireAdmin();
+        return assetClient.listAssets(page, pageSize, type, keyword, status);
+    }
+
+    @Transactional
+    public Map<String, Object> moderateAsset(Long assetId, String action) {
+        requireAdmin();
+        Map<String, Object> before = Map.of("assetId", assetId);
+        Map<String, Object> result = assetClient.moderate(assetId, Map.of("action", action));
+        audit("asset.moderate", "asset", assetId, before, Map.of("action", action, "status", result.get("status")));
+        return result;
     }
 
     private void requireAdmin() {

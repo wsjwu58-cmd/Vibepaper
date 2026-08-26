@@ -221,13 +221,20 @@ export interface PublicationView {
   canvasId: Id;
   ownerId: Id;
   title: string;
+  description?: string;
+  tags?: string[];
   status: string;
   thumbnailUrl?: string;
   previewAssetUrl?: string;
+  resultAssetUrls?: string[];
+  viewCount?: number;
+  nodeCount?: number;
+  rejectedReason?: string;
   authorName?: string;
   authorAvatar?: string;
   publishedAt?: string;
   createdAt?: string;
+  snapshot?: CanvasDetail;
 }
 
 export interface SkillView {

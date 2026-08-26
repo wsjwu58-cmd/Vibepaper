@@ -68,9 +68,28 @@ public class InternalController {
 
     @PostMapping("/canvases/import")
     public Map<String, Object> importInternal(@RequestBody Map<String, Object> body) {
-        Long ownerId = ((Number) body.get("ownerId")).longValue();
-        CanvasDtos.CanvasDetail detail = canvasService.importCanvas(body.get("json").toString(), ownerId);
+        Object rawOwner = body.get("ownerId");
+        if (rawOwner == null) {
+            throw com.vibepaper.common.api.ApiException.badRequest(
+                    com.vibepaper.common.api.ErrorCode.INVALID_INPUT, "ownerId 必填");
+        }
+        Long ownerId = rawOwner instanceof Number n ? n.longValue() : Long.parseLong(rawOwner.toString());
+        Object rawJson = body.get("json");
+        if (rawJson == null) {
+            throw com.vibepaper.common.api.ApiException.badRequest(
+                    com.vibepaper.common.api.ErrorCode.INVALID_INPUT, "json 必填");
+        }
+        String json = rawJson instanceof String s ? s : writeJson(rawJson);
+        CanvasDtos.CanvasDetail detail = canvasService.importCanvas(json, ownerId);
         return Map.of("canvasId", detail.canvas().id(), "name", detail.canvas().name());
+    }
+
+    private String writeJson(Object obj) {
+        try {
+            return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(obj);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     @GetMapping("/canvases/owner/{ownerId}/count")

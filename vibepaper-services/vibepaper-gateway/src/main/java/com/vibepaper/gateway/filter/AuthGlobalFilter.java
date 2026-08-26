@@ -65,27 +65,47 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         String path = exchange.getRequest().getURI().getPath();
         String method = exchange.getRequest().getMethod().name();
+        boolean whitelisted = false;
         for (String[] entry : WHITELIST) {
             if (MATCHER.match(entry[0], path) && (entry[1] == null || entry[1].equals(method))) {
-                return chain.filter(exchange);
+                whitelisted = true;
+                break;
             }
         }
 
         String auth = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+        if (whitelisted) {
+            // 公开接口：无 Token 直接放行；有 Token 则透传用户头（作者可看 pending 作品等）
+            if (auth == null || !auth.startsWith("Bearer ")) {
+                return chain.filter(exchange);
+            }
+            return attachUserHeaders(exchange, chain, auth.substring(7), true);
+        }
+
         if (auth == null || !auth.startsWith("Bearer ")) {
             return reject(exchange, "AUTHENTICATION_REQUIRED", "请先登录", HttpStatus.UNAUTHORIZED, false);
         }
-        String token = auth.substring(7);
+        return attachUserHeaders(exchange, chain, auth.substring(7), false);
+    }
+
+    private Mono<Void> attachUserHeaders(ServerWebExchange exchange, GatewayFilterChain chain,
+                                         String token, boolean optional) {
         Claims claims;
         try {
             claims = jwtUtil.parse(token);
         } catch (Exception e) {
+            if (optional) {
+                return chain.filter(exchange);
+            }
             return reject(exchange, "UNAUTHORIZED", "登录已过期，请重新登录", HttpStatus.UNAUTHORIZED, true);
         }
         String jti = claims.get("jti", String.class);
         return redis.hasKey("auth:revoked:" + jti)
                 .flatMap(revoked -> {
                     if (Boolean.TRUE.equals(revoked)) {
+                        if (optional) {
+                            return chain.filter(exchange);
+                        }
                         return reject(exchange, "UNAUTHORIZED", "登录已失效，请重新登录", HttpStatus.UNAUTHORIZED, false);
                     }
                     ServerHttpRequest mutated = exchange.getRequest().mutate()

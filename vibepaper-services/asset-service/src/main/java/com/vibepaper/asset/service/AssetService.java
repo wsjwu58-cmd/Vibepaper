@@ -234,6 +234,35 @@ public class AssetService {
         return assetMapper.selectById(assetId);
     }
 
+    /** 运营后台：全库分页素材（不限 owner） */
+    public PageResult<AssetDtos.AssetView> adminList(int page, int pageSize, String type, String keyword, String status) {
+        LambdaQueryWrapper<Asset> qw = new LambdaQueryWrapper<Asset>()
+                .eq(type != null && !type.isBlank(), Asset::getAssetType, type)
+                .eq(status != null && !status.isBlank(), Asset::getStatus, status)
+                .like(keyword != null && !keyword.isBlank(), Asset::getName, keyword)
+                .orderByDesc(Asset::getCreatedAt);
+        Page<Asset> p = assetMapper.selectPage(new Page<>(page, pageSize), qw);
+        return PageResult.of(p.getRecords().stream().map(this::toView).toList(), p.getTotal(), page, pageSize);
+    }
+
+    @Transactional
+    public AssetDtos.AssetView adminModerate(Long assetId, String action) {
+        Asset asset = assetMapper.selectById(assetId);
+        if (asset == null) {
+            throw ApiException.notFound("素材不存在");
+        }
+        if ("block".equals(action)) {
+            asset.setStatus("blocked");
+        } else if ("unblock".equals(action)) {
+            asset.setStatus("ready");
+        } else {
+            throw ApiException.badRequest(ErrorCode.INVALID_INPUT, "action 必须是 block/unblock");
+        }
+        asset.setUpdatedAt(OffsetDateTime.now());
+        assetMapper.updateById(asset);
+        return toView(asset);
+    }
+
     public List<Asset> searchAssets(String keyword, String type, Long enterpriseId) {
         LambdaQueryWrapper<Asset> qw = new LambdaQueryWrapper<Asset>()
                 .and(w -> w.eq(Asset::getOwnerId, RequestContext.userIdLong())
