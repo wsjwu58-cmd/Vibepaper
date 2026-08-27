@@ -1,13 +1,8 @@
-"""对话内确认：显式指令自动确认 / 文本「确认」「取消」续跑。"""
+"""对话内确认：仅 API/卡片确认，禁止自然语言自动放行。"""
 
 from __future__ import annotations
 
 import re
-
-EXPLICIT_EXEC = re.compile(
-    r"生成|提交|做成|转换|图生视频|删除|移除|覆盖|重做|重跑|扩图|超分|抽帧|提帧|剪辑",
-    re.I,
-)
 
 _CONFIRM = re.compile(
     r"^(确认|确定|好的|好|是|是的|可以|行|执行|继续|同意|ok|yes|y)$",
@@ -17,24 +12,7 @@ _CANCEL = re.compile(r"^(取消|不要|算了|拒绝|no|n)$", re.I)
 
 
 def should_auto_confirm(user_content: str, tool_name: str) -> bool:
-    """用户已给出明确执行意图时，在对话内视为已确认，不再弹出按钮。"""
-    content = (user_content or "").strip()
-    if not content:
-        return False
-    if tool_name == "delete_nodes":
-        return bool(re.search(r"删除|移除", content, re.I))
-    if tool_name in (
-        "submit_generation",
-        "replace_output",
-        "change_model",
-        "extract_frames",
-        "trim_clip",
-        "upscale",
-        "outpaint",
-        "compose_final",
-        "capture_3d_scene",
-    ):
-        return bool(EXPLICIT_EXEC.search(content))
+    """P0：高风险操作一律不得自动确认。"""
     return False
 
 
@@ -74,7 +52,7 @@ def build_dialog_confirm_prompt(action: dict, chain_cost: int = 0) -> str:
         cost_line = ""
     return (
         f"即将执行：{summary}。{cost_line}\n"
-        "请在对话中回复「确认」继续，或「取消」放弃。"
+        "请在确认卡片中点击「确认」或「取消」；普通聊天文本不能替代确认。"
     )
 
 

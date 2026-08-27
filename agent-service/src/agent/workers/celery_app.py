@@ -68,22 +68,18 @@ def drain_memory_queue():
 
 @celery_app.task(name="agent.scan_clock_jobs")
 def scan_clock_jobs():
-    import time
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
     import redis
     from ..graph.app import run_agent_wakeup
+    from ..infrastructure.clock_queue import claim_due_jobs, schedule_job
     from ..services.telemetry import clock_wakeup
 
     r = redis.Redis.from_url(settings.redis_url, decode_responses=True, protocol=2)
-    now = time.time()
-    # 每次少取几条，避免单次扫描拖死 inline loop
-    due = r.zrangebyscore("agent_clock_jobs", 0, now, start=0, num=5)
     done = 0
-    for item in due:
-        r.zrem("agent_clock_jobs", item)
+    for job in claim_due_jobs(r, limit=5):
+        item = json.dumps(job, ensure_ascii=False)
         try:
-            job = json.loads(item)
             note = job.get("note") or {}
             user_id = int(job.get("user_id") or note.get("user_id") or 0)
             session_id = int(note.get("session_id") or 0)
@@ -105,12 +101,12 @@ def scan_clock_jobs():
                             "clock wakeup timed out session=%s task=%s",
                             session_id, note.get("task_id"),
                         )
-                        # 终态任务可稍后重试；避免永久丢弃
+                        import time
                         retry_at = time.time() + 30
-                        r.zadd("agent_clock_jobs", {item: retry_at})
+                        schedule_job(r, job, retry_at)
             done += 1
         except Exception:
-            logger.exception("clock job failed")
+            logger.exception("clock job failed item=%s", item[:120])
     return {"done": done}
 
 

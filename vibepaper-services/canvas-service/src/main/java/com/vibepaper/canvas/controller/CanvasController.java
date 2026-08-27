@@ -2,6 +2,7 @@ package com.vibepaper.canvas.controller;
 
 import com.vibepaper.canvas.dto.CanvasDtos;
 import com.vibepaper.canvas.service.CanvasService;
+import com.vibepaper.canvas.service.DramaAssetService;
 import com.vibepaper.canvas.service.GraphService;
 import com.vibepaper.common.api.PageResult;
 import jakarta.validation.Valid;
@@ -18,6 +19,7 @@ import java.util.Map;
 public class CanvasController {
     private final CanvasService canvasService;
     private final GraphService graphService;
+    private final DramaAssetService dramaAssetService;
 
     @PostMapping
     public CanvasDtos.CanvasView create(@Valid @RequestBody CanvasDtos.CreateCanvasRequest req) {
@@ -148,6 +150,25 @@ public class CanvasController {
     public Map<String, String> deleteStack(@PathVariable Long canvasId, @PathVariable Long stackId) {
         graphService.deleteStack(canvasId, stackId);
         return Map.of("status", "ok");
+    }
+
+    // ---- 短剧领域资产 ----
+    @PostMapping("/{canvasId}/drama-assets")
+    public CanvasDtos.DramaAssetPayload upsertDramaAsset(
+            @PathVariable Long canvasId,
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Valid @RequestBody CanvasDtos.UpsertDramaAssetRequest req) {
+        return dramaAssetService.upsert(canvasId, idempotencyKey, req);
+    }
+
+    @GetMapping("/{canvasId}/drama-assets")
+    public Map<String, Object> listDramaAssets(
+            @PathVariable Long canvasId,
+            @RequestParam(required = false) String assetType,
+            @RequestParam(required = false) String episodeId,
+            @RequestParam(required = false) String sceneId,
+            @RequestParam(required = false) String shotId) {
+        return Map.of("items", dramaAssetService.list(canvasId, assetType, episodeId, sceneId, shotId));
     }
 
     // ---- 分享 ----

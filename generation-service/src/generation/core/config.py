@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     admin_base_url: str = "http://localhost:8087"
     canvas_base_url: str = "http://localhost:8082"
     agent_base_url: str = "http://localhost:8091"
+    internal_service_token: str = ""
     nacos_addr: str = "192.168.141.129:8848"
     nacos_username: str = "nacos"
     nacos_password: str = "nacos"

@@ -10,6 +10,8 @@ import httpx
 
 from ...core.config import settings
 from ...core.db import SessionLocal
+from ...domain.action_states import WAITING_TERMINAL
+from ...domain.idempotency import derive_idempotency_key
 from ...models import AgentAction, AgentMessage, AgentSession
 from ...services.telemetry import agent_action_fail, agent_action_success
 from ...tools.registry import TOOLS, _coerce_node_id, headers_for
@@ -159,10 +161,15 @@ def executor_node(state: AgentState) -> dict:
                     confirm_reason=action.get("confirm_reason"),
                     status="pending",
                     canvas_version=canvas_version,
+                    plan_version=int((state.get("plan") or {}).get("version") or state.get("run_version") or 1),
+                    step_id=action.get("step_id"),
+                    idempotency_key=derive_idempotency_key(action_id, 1),
                     created_at=datetime.now(timezone.utc),
                 )
                 db.add(record)
                 db.flush()
+            elif not record.idempotency_key:
+                record.idempotency_key = derive_idempotency_key(record.id, record.attempt_no or 1)
 
             if tool_name in EXEC_TOOLS or tool_name == "submit_generation":
                 node_id = params.get("node_id") or params.get("nodeId")
@@ -193,7 +200,8 @@ def executor_node(state: AgentState) -> dict:
                             "note": "任务已在队列中，未重复提交",
                             "node_id": coerced,
                         }
-                        record.status = "executed"
+                        record.status = WAITING_TERMINAL
+                        record.task_id = str(data["task_id"])
                         record.result = data
                         _write_result_message(db, state["session_id"], tool_name, True, data)
                         db.commit()
@@ -273,6 +281,9 @@ def executor_node(state: AgentState) -> dict:
                 tool_extra = {}
                 if tool_name == "create_nodes":
                     tool_extra["user_content"] = state.get("user_content") or ""
+                if tool_name in EXEC_TOOLS:
+                    tool_extra["agent_action_id"] = action_id
+                    tool_extra["idempotency_key"] = record.idempotency_key
                 data = _call_tool(tool, canvas_id, user_id, params, extra=tool_extra)
                 ok = "error" not in data
                 if ok and tool_name == "create_nodes":
@@ -303,7 +314,11 @@ def executor_node(state: AgentState) -> dict:
                         "node_id": params.get("node_id"),
                         "model_type": params.get("model_type"),
                     }
-                record.status = "executed" if ok else "failed"
+                if ok and tool_name in EXEC_TOOLS and data.get("task_id"):
+                    record.status = WAITING_TERMINAL
+                    record.task_id = str(data["task_id"])
+                else:
+                    record.status = "executed" if ok else "failed"
                 record.result = data
                 record.error_code = None if ok else "TOOL_ERROR"
                 if tool_name in EXEC_TOOLS and ok:

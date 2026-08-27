@@ -777,7 +777,25 @@ def _submit_generation(canvas_id: int, user_id: int, node_id: int, model_type: s
     )
     params.setdefault("model", resolved_model)
 
-    idem = uuid.uuid4().hex
+    idem = str(ctx.get("idempotency_key") or "").strip()
+    if not idem:
+        # 非图执行入口（兼容内部工具/测试）同样必须稳定；正常 Agent 路径由
+        # executor 注入 action_id 派生的键，避免用户显式重跑被错误合并。
+        fingerprint = json.dumps(
+            {
+                "userId": user_id,
+                "canvasId": canvas_id,
+                "nodeId": coerced,
+                "model": resolved_model,
+                "params": params,
+                "estimatedCost": max(1, int(estimated_cost)),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        idem = f"agt-legacy:{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:48]}"
     body = {
         "userId": user_id,
         "nodeId": coerced,

@@ -15,6 +15,10 @@ import {
   Lightbulb,
   ListTree,
   Megaphone,
+  Clapperboard,
+  AlertTriangle,
+  Check,
+  XCircle,
 } from 'lucide-react'
 import { api, authedFetch } from '@/lib/api'
 import { parseJsonPreserveIds } from '@/lib/ids'
@@ -25,10 +29,11 @@ import { ModelPicker } from '@/components/ui/ModelPicker'
 import { useCanvasStore } from './canvasStore'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
 import { cn } from '@/lib/cn'
-import type { AgentChatMsg, AgentSuggestion, ExecutionStep } from './agentTypes'
+import type { AgentChatMsg, AgentConfirmation, AgentSuggestion, ExecutionStep } from './agentTypes'
 import { AgentNextActions, AgentTaskBadge, AgentTurnTimeline } from './AgentExecutionRecord'
 import { applyAgentEvent, isChatVisibleMessage, shouldRefreshCanvas } from './agentEventHandlers'
 import { AgentComposerBar, refFromNode, upsertRefs, type ComposerRef } from './AgentComposerBar'
+import { DramaAssetsTab } from './DramaAssetsTab'
 
 const AGENT_PANEL_DEFAULT_WIDTH = 380
 const AGENT_PANEL_MIN_WIDTH = 300
@@ -81,7 +86,7 @@ export function AgentPanel() {
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
-  const [tab, setTab] = useState<'chat' | 'pref' | 'skills' | 'usage' | 'history'>('chat')
+  const [tab, setTab] = useState<'chat' | 'pref' | 'skills' | 'usage' | 'history' | 'drama'>('chat')
   const [selectedNodes, setSelectedNodes] = useState<string[]>([])
   const [composerRefs, setComposerRefs] = useState<ComposerRef[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -92,6 +97,7 @@ export function AgentPanel() {
   const seenWakeupRef = useRef<Map<string, number>>(new Map())
   /** 本轮回复逐字动画标记 */
   const [typingTurnId, setTypingTurnId] = useState<string | null>(null)
+  const [confirmingActionId, setConfirmingActionId] = useState<string | null>(null)
   const busyRef = useRef(false)
   const canvasId = canvas?.canvas.id
 
@@ -411,9 +417,51 @@ export function AgentPanel() {
     setMessages((m) => applyAgentEvent(m, ev, turnIdRef.current))
   }
 
+  const patchConfirmation = (actionId: string, status: AgentConfirmation['status']) => {
+    setMessages((items) =>
+      items.map((item) =>
+        item.meta?.confirmation?.actionId === actionId
+          ? { ...item, meta: { ...item.meta, confirmation: { ...item.meta.confirmation, status } } }
+          : item,
+      ),
+    )
+  }
+
+  const confirmAction = async (confirmation: AgentConfirmation, accept: boolean) => {
+    if (!sessionId || confirmingActionId) return
+    setConfirmingActionId(confirmation.actionId)
+    patchConfirmation(confirmation.actionId, 'submitting')
+    try {
+      const result = await api<{ ok: boolean; cancelled?: boolean; events?: Record<string, unknown>[] }>(
+        `/agent/sessions/${sessionId}/confirmations/${confirmation.actionId}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ approvalToken: confirmation.approvalToken, accept }),
+        },
+      )
+      patchConfirmation(confirmation.actionId, accept ? 'accepted' : 'rejected')
+      for (const event of result.events ?? []) processStreamEvent(event)
+      if (accept) toastSuccess('已确认，Agent 正在继续执行')
+    } catch (error) {
+      patchConfirmation(confirmation.actionId, 'pending')
+      toastError((error as Error).message || '确认操作失败')
+    } finally {
+      setConfirmingActionId(null)
+    }
+  }
+
+  const hasPendingConfirmation = messages.some((item) => {
+    const status = item.meta?.confirmation?.status
+    return status === 'pending' || status === 'submitting'
+  })
+
   const send = async () => {
     const content = input.trim()
     if (!content || busy) return
+    if (hasPendingConfirmation) {
+      toastError('请先在确认卡片中确认或取消当前高风险操作')
+      return
+    }
     const isFirstUserTurn = !messages.some((m) => m.role === 'user')
     setInput('')
     setBusy(true)
@@ -534,7 +582,7 @@ export function AgentPanel() {
         />
       </div>
       <div className="flex h-full flex-col" style={{ width }}>
-      {tab !== 'skills' && (
+      {tab !== 'skills' && tab !== 'drama' && (
       <div className="flex items-center justify-between px-4 py-3.5">
         <div className="flex items-center gap-2.5">
           <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#111] text-white">
@@ -559,6 +607,7 @@ export function AgentPanel() {
             <NavIcon tab="chat" current={tab} set={setTab} icon={Bot} label="对话" />
           )}
           <NavIcon tab="skills" current={tab} set={setTab} icon={BookOpen} label="Skills" />
+          <NavIcon tab="drama" current={tab} set={setTab} icon={Clapperboard} label="短剧资产" />
           <NavIcon tab="history" current={tab} set={setTab} icon={History} label="历史" />
           <NavIcon tab="usage" current={tab} set={setTab} icon={BarChart3} label="用量" />
           <NavIcon tab="pref" current={tab} set={setTab} icon={Settings2} label="偏好" />
@@ -630,6 +679,12 @@ export function AgentPanel() {
                         }}
                       />
                       <AgentTaskBadge status={m.meta?.taskStatus?.status} taskId={m.meta?.taskStatus?.taskId} />
+                      {m.meta?.confirmation && (
+                        <AgentConfirmationCard
+                          confirmation={m.meta.confirmation}
+                          onConfirm={(accept) => void confirmAction(m.meta!.confirmation!, accept)}
+                        />
+                      )}
                       {m.meta?.nextActions && m.meta.nextActions.length > 0 && (
                         <AgentNextActions
                           actions={m.meta.nextActions}
@@ -710,7 +765,7 @@ export function AgentPanel() {
                   }}
                   rows={3}
                   placeholder="描述创意或需求，@ 引用参考，/ 选择 Skill"
-                  disabled={busy}
+                  disabled={busy || hasPendingConfirmation}
                   className="block min-h-[72px] w-full resize-none bg-transparent px-3 pb-12 pt-3 text-[13px] leading-relaxed text-[var(--canvas-text)] outline-none placeholder:text-[var(--canvas-muted-soft)] disabled:opacity-60"
                 />
                 <div className="absolute bottom-2 left-2 right-2 z-10 flex min-w-0 items-center gap-1.5">
@@ -770,11 +825,11 @@ export function AgentPanel() {
                   ) : (
                     <button
                       type="submit"
-                      disabled={!input.trim()}
+                      disabled={!input.trim() || hasPendingConfirmation}
                       aria-label="发送"
                       className={cn(
                         'inline-flex size-7 items-center justify-center rounded-lg transition-colors',
-                        input.trim()
+                        input.trim() && !hasPendingConfirmation
                           ? 'bg-[var(--canvas-active)] text-[var(--canvas-active-text)] hover:opacity-90'
                           : 'cursor-not-allowed bg-[var(--canvas-surface-muted)] text-[var(--canvas-muted-soft)]',
                       )}
@@ -801,6 +856,13 @@ export function AgentPanel() {
           }}
         />
       )}
+      {tab === 'drama' && (
+        <DramaAssetsTab
+          canvasId={canvas?.canvas.id}
+          canvasVersion={canvas?.canvas.version}
+          onBack={() => setTab('chat')}
+        />
+      )}
       {tab === 'usage' && <UsageTab sessionId={sessionId} />}
       {tab === 'history' && (
         <HistoryTab
@@ -815,6 +877,85 @@ export function AgentPanel() {
   )
 }
 
+function AgentConfirmationCard({
+  confirmation,
+  onConfirm,
+}: {
+  confirmation: AgentConfirmation
+  onConfirm: (accept: boolean) => void
+}) {
+  const pending = confirmation.status === 'pending'
+  const submitting = confirmation.status === 'submitting'
+  const total = confirmation.estimatedTotalCost ?? confirmation.estimatedCost ?? 0
+  const statusText =
+    confirmation.status === 'accepted'
+      ? '已确认，正在继续执行'
+      : confirmation.status === 'rejected'
+        ? '已取消此操作'
+        : submitting
+          ? '正在提交确认…'
+          : '需要你的确认'
+
+  return (
+    <section className="mt-2 rounded-xl border border-amber-300/80 bg-amber-50 p-3 text-[12px] text-amber-950">
+      <div className="flex items-start gap-2">
+        {confirmation.status === 'accepted' ? (
+          <Check className="mt-0.5 size-4 shrink-0 text-emerald-700" />
+        ) : confirmation.status === 'rejected' ? (
+          <XCircle className="mt-0.5 size-4 shrink-0 text-[#777]" />
+        ) : (
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700" />
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="font-bold">{statusText}</p>
+          <p className="mt-1 break-words leading-relaxed">{confirmation.summary}</p>
+          {confirmation.confirmReason && (
+            <p className="mt-1 leading-relaxed text-amber-900/80">原因：{confirmation.confirmReason}</p>
+          )}
+          <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-amber-900/85">
+            <div>
+              <dt className="inline">预计点数：</dt>
+              <dd className="inline font-semibold">{total}</dd>
+            </div>
+            {confirmation.affectedNodeCount ? (
+              <div>
+                <dt className="inline">影响节点：</dt>
+                <dd className="inline font-semibold">{confirmation.affectedNodeCount}</dd>
+              </div>
+            ) : null}
+            {confirmation.expiresAt ? (
+              <div className="col-span-2">
+                <dt className="inline">确认有效期至：</dt>
+                <dd className="inline font-semibold">{new Date(confirmation.expiresAt).toLocaleString()}</dd>
+              </div>
+            ) : null}
+          </dl>
+        </div>
+      </div>
+      {pending || submitting ? (
+        <div className="mt-3 flex justify-end gap-2">
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => onConfirm(false)}
+            className="rounded-lg border border-amber-400/80 bg-white px-2.5 py-1.5 font-semibold text-amber-950 transition hover:bg-amber-100 disabled:cursor-wait disabled:opacity-60"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => onConfirm(true)}
+            className="rounded-lg bg-amber-800 px-2.5 py-1.5 font-semibold text-white transition hover:bg-amber-900 disabled:cursor-wait disabled:opacity-60"
+          >
+            确认执行
+          </button>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
 function NavIcon({
   tab,
   current,
@@ -822,9 +963,9 @@ function NavIcon({
   icon: Icon,
   label,
 }: {
-  tab: 'chat' | 'pref' | 'skills' | 'usage' | 'history'
+  tab: 'chat' | 'pref' | 'skills' | 'usage' | 'history' | 'drama'
   current: string
-  set: (t: 'chat' | 'pref' | 'skills' | 'usage' | 'history') => void
+  set: (t: 'chat' | 'pref' | 'skills' | 'usage' | 'history' | 'drama') => void
   icon: React.ComponentType<{ size?: number }>
   label: string
 }) {

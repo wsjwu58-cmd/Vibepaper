@@ -383,8 +383,12 @@ class TaskService:
         if not base:
             return
         try:
+            headers = {}
+            if (settings.internal_service_token or "").strip():
+                headers["X-Internal-Service-Token"] = settings.internal_service_token.strip()
             httpx.post(
                 f"{base}/internal/agent/resume",
+                headers=headers,
                 json={
                     "type": "generation_terminal",
                     "task_id": task.id,
