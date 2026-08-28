@@ -63,6 +63,7 @@ Thumbs.db
 .codegraph/
 .firecrawl/
 .workbuddy/
+.worktrees/
 .trae-html-share-packages/
 agent-design-optimization/
 agent-test-framework/
