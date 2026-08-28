@@ -16,7 +16,7 @@
 |------|------|
 | 无限画布 | 平移缩放、节点/连线 CRUD、乐观锁自动保存、导入导出 |
 | 多模态生成 | 文本 / 图片 / 视频 / 音频节点，任务状态机与消耗预览 |
-| Agent 编排 | SSE 流式对话、工具白名单、高风险操作确认令牌 |
+| Agent 编排 | 基于 Pi Agent Core 的 SSE 流式对话、工具白名单、高风险操作确认令牌 |
 | 点数计费 | 冻结 → 结算 / 解冻，流水只追加，超时自动解冻 |
 | 素材库 | 上传、拖入画布、引用检查 |
 | 管理空间 | 画布管理、任务历史、订阅/点数、个人中心 |
@@ -37,8 +37,9 @@ vibepaper-gateway (Spring Cloud Gateway)
    ┌────┴─────────────────────────────┐
    │ Java 21 + Spring Boot            │ Python 3.12 + FastAPI
    │ identity · canvas · asset        │ generation-service
-   │ billing · enterprise · gallery   │ agent-service
-   │ admin                            │
+   │ billing · enterprise · gallery   │
+   │ admin               Node.js + TypeScript + Fastify
+   │                     agent-service（Pi Agent Core）
    └────┬─────────────────────────────┘
    PostgreSQL · Redis · Nacos · RocketMQ · MinIO（可本地文件替代）
 ```
@@ -48,7 +49,7 @@ vibepaper-gateway (Spring Cloud Gateway)
 | `vibepaper-web` | React 19 · Vite · Zustand · TanStack Query · Tailwind | 前端单应用 |
 | `vibepaper-services` | Java 21 · Spring Boot 3 · Spring Cloud Gateway | 业务微服务 + 网关 |
 | `generation-service` | FastAPI · 任务状态机 · Mock/真实 Provider | 生成与模型目录 |
-| `agent-service` | FastAPI · LangGraph · SSE | Agent 会话与工具 |
+| `agent-service` | Node.js 22.19+ · TypeScript · Fastify · Pi Agent Core · SSE | Agent 会话、短剧领域编排与受控工具 |
 | `deploy/` | PowerShell / Docker Compose | 本地启停与基础设施 |
 
 ---
@@ -59,7 +60,8 @@ vibepaper-gateway (Spring Cloud Gateway)
 docs/                  # PRD、技术概要、功能清单、Spec、执行计划
 vibepaper-services/    # Java 微服务（common + gateway + 业务服务）
 generation-service/    # Python 生成服务
-agent-service/         # Python Agent 服务
+pi-main/                # 锁定的 Pi 上游源码与 VibePaper Agent 工作区
+  packages/vibepaper-agent-service/  # Node.js + Pi 的 Agent 服务
 vibepaper-web/         # React 前端
 deploy/                # 一键启停与 compose
 AGENTS.md              # Agent / 协作者工程契约
@@ -72,8 +74,8 @@ AGENTS.md              # Agent / 协作者工程契约
 ### 环境要求
 
 - JDK 21、Maven
-- Python 3.12、[uv](https://github.com/astral-sh/uv) 或 venv
-- Node.js 20+、pnpm
+- Python 3.12、[uv](https://github.com/astral-sh/uv) 或 venv（仅 generation-service）
+- Node.js 22.19+、npm、pnpm
 - PostgreSQL、Redis；可选 Nacos、RocketMQ、MinIO
 
 本地数据库、中间件地址与密码请通过环境变量或本地配置文件覆盖，**不要**把真实凭据提交进仓库。可参考各服务下的 `.env.example`（如有）。
@@ -85,16 +87,33 @@ cd vibepaper-services
 mvn -s settings-project.xml install -DskipTests
 ```
 
-### Python 服务
+### Python 生成服务
 
 ```powershell
 cd generation-service
 # 创建 venv、安装依赖后：
 python scripts\init_db.py
-
-cd ..\agent-service
-python scripts\init_db.py
 ```
+
+### Pi Agent 服务
+
+`agent-service` 已迁移为 Pi Agent Core 的 Node.js 服务。Pi 上游源码位于 `pi-main/`，VibePaper 的二次开发代码只位于 `pi-main/packages/vibepaper-agent-service/`，不修改上游的 `packages/agent`、`packages/ai` 或 `packages/coding-agent`。
+
+```powershell
+cd pi-main
+npm install --ignore-scripts
+npm run build --workspace=@vibepaper/pi-agent-service
+
+Copy-Item packages\vibepaper-agent-service\.env.example packages\vibepaper-agent-service\.env
+# 在 .env 中填入 VIBEPAPER_DATABASE_URL、VIBEPAPER_REDIS_URL 与 Agnes API Key
+npm run start --workspace=@vibepaper/pi-agent-service
+```
+
+服务默认监听 `8091`。模型配置沿用原有 Agnes 兼容接口：优先使用 `VIBEPAPER_LLM_*`，未设置时回退到 `VIBEPAPER_AGNES_*`；默认模型为 `agnes-2.5-flash`。
+
+短剧垂直 Agent 把角色、世界观、剧集索引和镜头链条作为可读写的持久化事实，按“故事圣经 → 单集 → 分镜 → 提示词 → 关键帧 → 视频 → 拼接”分层执行。人物镜头缺少角色参考图、关键帧未就绪即提交视频等情况由服务端工具约束拒绝，不能仅靠提示词规避。
+
+Skill 仅向会话注入索引；正文通过 `load_skill` 按需加载。内置画布 Skill 与用户可启停的动态 Skill 均遵守用户本次指令、单次卡片覆写、全局偏好、Skill 内容、模型默认值的优先级。
 
 ### 一键启停（本机已装好中间件时）
 
@@ -134,6 +153,8 @@ pnpm dev   # http://localhost:5173
 | [技术概要设计](./docs/技术概要设计方案.md) | 微服务与技术选型 |
 | [工程 Spec](./docs/specs/V1.0-engineering-spec.md) | V1.0 工程说明 |
 | [执行计划](./docs/plans/execution-plan.md) | 分阶段排期 |
+| [Pi 全量迁移设计](./docs/specs/pi-agent-full-replacement-design.md) | Node.js + Pi Agent Core 的迁移基线 |
+| [短剧 Agent 方向](./docs/specs/pi-vertical-short-drama-agent-direction.md) | 短剧状态层、镜头流水线、审校与调度 |
 
 ---
 

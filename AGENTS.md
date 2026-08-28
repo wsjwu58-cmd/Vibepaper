@@ -39,7 +39,7 @@ VibePaper 是 AI 原生**节点化无限画布**创作平台：文本/图片/视
 
 ### 3.1 架构形态
 
-- **微服务**：业务模块 Java；Agent/生成模块 Python。
+- **微服务**：业务模块 Java；生成模块 Python；Agent 模块 Node.js + TypeScript（基于 Pi Agent Core）。
 - **禁止**跨服务直连对方数据库；只能经 REST / RocketMQ。
 - **禁止**服务间循环依赖。
 - 各服务独立 PostgreSQL 库；全局 ID 使用 **Snowflake**（若与 PRD UUIDv4 冲突，以本规范 + 技术概要为准，并回写 PRD）。
@@ -56,7 +56,7 @@ VibePaper 是 AI 原生**节点化无限画布**创作平台：文本/图片/视
 | `gallery-service` | Java | 发布审核搜索克隆 |
 | `admin-service` | Java | 运营后台审计 |
 | `generation-service` | Python 3.12 + FastAPI | 模型目录、任务状态机、ComfyUI/供应商 |
-| `agent-service` | Python 3.12 + FastAPI | Agent 会话、LangGraph、工具、记忆 |
+| `agent-service` | Node.js 22.19+ + TypeScript + Fastify + Pi Agent Core | Agent 会话、Pi 编排、工具、记忆 |
 | `vibepaper-gateway` | Java + Spring Cloud Gateway | 路由鉴权限流 CORS |
 | `vibepaper-web` | React + TS + Vite + pnpm | 单前端应用 |
 
@@ -72,7 +72,9 @@ React + TypeScript · Vite · `@xyflow/react` · Zustand（画布本地）· Tan
 
 **Java**：`controller → service → mapper`；Controller 只接 DTO/返 VO；`@Transactional` 仅 Service；事务内禁止 Feign/发 MQ（用 Outbox）。
 
-**Python**：`router → application → domain → infrastructure`；Pydantic Schema 与 ORM 分离；domain 不依赖 FastAPI/SQLAlchemy/Celery。
+**Python（generation-service）**：`router → application → domain → infrastructure`；Pydantic Schema 与 ORM 分离；domain 不依赖 FastAPI/SQLAlchemy/Celery。
+
+**Node（agent-service）**：`server → application → domain → pi/tools/infrastructure`；Pi 与 domain 不依赖 Fastify、数据库、MQ 或供应商 SDK；副作用只能通过受控 Tool Gateway 触发。
 
 ---
 

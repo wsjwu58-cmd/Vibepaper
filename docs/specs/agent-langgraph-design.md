@@ -1,9 +1,9 @@
-# VibePaper Agent 编排设计（LangGraph）
+# VibePaper Agent 编排设计（LangGraph，已被替代）
 
-> **状态**：草案（待 agent-service 落地评审）  
+> **状态**：已被 pi-agent-full-replacement-design.md 替代；仅保留产品契约和历史迁移参考。
 > **编制日期**：2026-08-02  
 > **依据**：PRD §5.2 / §6.5 · 技术概要 §5.2–5.4 · `AGENTS.md` §6 · 产品介绍与使用说明（飞书）  
-> **范围**：`agent-service` 内编排图、意图、工具门控、确认续跑与分阶段迁移；不替代 PRD 确认阈值与计费契约。  
+> **范围**：历史 LangGraph 方案；新的 Node/TypeScript Pi Agent 方案见 pi-agent-full-replacement-design.md。
 > **冲突裁决**：确认阈值 / 点数 / 状态机以 PRD 为准；服务边界与通信以技术概要为准；本文件细化 **如何编排**。
 
 ---

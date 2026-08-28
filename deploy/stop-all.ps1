@@ -21,13 +21,10 @@ foreach ($port in $ports) {
             }
         }
 }
-Get-CimInstance Win32_Process -Filter "name='uvicorn.exe'" | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    Write-Host "STOPPED uvicorn $($_.ProcessId)"
-}
-Get-CimInstance Win32_Process | Where-Object {
-    $_.CommandLine -and ($_.CommandLine -match 'celery_app|agent\.workers\.celery')
-} | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    Write-Host "STOPPED celery $($_.ProcessId)"
+Get-NetTCPConnection -LocalPort 8090,8091 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
+    $procId = $_.OwningProcess
+    if ($procId -and $procId -gt 0) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        Write-Host "STOPPED agent/generation port $($_.LocalPort) pid $procId"
+    }
 }
