@@ -32,7 +32,16 @@ import { cn } from '@/lib/cn'
 import type { AgentChatMsg, AgentConfirmation, AgentSuggestion, ExecutionStep } from './agentTypes'
 import { AgentNextActions, AgentTaskBadge, AgentTurnTimeline } from './AgentExecutionRecord'
 import { applyAgentEvent, isChatVisibleMessage, shouldRefreshCanvas } from './agentEventHandlers'
-import { AgentComposerBar, refFromNode, upsertRefs, type ComposerRef } from './AgentComposerBar'
+import { AgentComposerBar } from './AgentComposerBar'
+import { AgentNodeReferenceCards } from './AgentNodeReferenceCards'
+import {
+  consumeSentNodeRefs,
+  newlySelectedComposerRefs,
+  nodeReferencesForComposer,
+  refFromNode,
+  upsertRefs,
+  type ComposerRef,
+} from './agentNodeReferences'
 import { DramaAssetsTab } from './DramaAssetsTab'
 
 const AGENT_PANEL_DEFAULT_WIDTH = 380
@@ -87,8 +96,8 @@ export function AgentPanel() {
   const [busy, setBusy] = useState(false)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [tab, setTab] = useState<'chat' | 'pref' | 'skills' | 'usage' | 'history' | 'drama'>('chat')
-  const [selectedNodes, setSelectedNodes] = useState<string[]>([])
   const [composerRefs, setComposerRefs] = useState<ComposerRef[]>([])
+  const previousSelectedNodeIdsRef = useRef<Set<string>>(new Set())
   const bottomRef = useRef<HTMLDivElement>(null)
   const sseAbortRef = useRef<AbortController | null>(null)
   const sendAbortRef = useRef<AbortController | null>(null)
@@ -302,20 +311,13 @@ export function AgentPanel() {
   const canvasNodes = useCanvasStore((s) => s.nodes)
 
   useEffect(() => {
-    const pick = (nodes: { selected?: boolean; id: string | number; data?: { node?: { id?: string | number } } }[]) =>
-      nodes.filter((n) => n.selected).map((n) => String(n.data?.node?.id ?? n.id))
-    setSelectedNodes(pick(useCanvasStore.getState().nodes))
-    const unsub = useCanvasStore.subscribe((s) => {
-      const ids = pick(s.nodes)
-      setSelectedNodes(ids)
-      if (ids.length === 0) return
-      const add: ComposerRef[] = []
-      for (const n of s.nodes) {
-        if (!n.selected) continue
-        add.push(refFromNode(n.data.node))
-      }
-      if (add.length) setComposerRefs((prev) => upsertRefs(prev, add))
-    })
+    const syncSelection = (nodes: typeof canvasNodes) => {
+      const { selectedIds, added } = newlySelectedComposerRefs(nodes, previousSelectedNodeIdsRef.current)
+      previousSelectedNodeIdsRef.current = selectedIds
+      if (added.length) setComposerRefs((prev) => upsertRefs(prev, added))
+    }
+    syncSelection(useCanvasStore.getState().nodes)
+    const unsub = useCanvasStore.subscribe((state) => syncSelection(state.nodes))
     return unsub
   }, [])
 
@@ -462,6 +464,9 @@ export function AgentPanel() {
       toastError('请先在确认卡片中确认或取消当前高风险操作')
       return
     }
+    const sentNodeRefs = composerRefs.filter((ref) => ref.kind === 'node')
+    const sentNodeIds = [...new Set(sentNodeRefs.map((ref) => ref.id))]
+    const nodeReferences = nodeReferencesForComposer(sentNodeRefs, useCanvasStore.getState().nodes)
     const isFirstUserTurn = !messages.some((m) => m.role === 'user')
     setInput('')
     setBusy(true)
@@ -479,7 +484,13 @@ export function AgentPanel() {
     setTypingTurnId(turnId)
     setMessages((m) => [
       ...m,
-      { id: Date.now(), role: 'user', type: 'text', content },
+      {
+        id: Date.now(),
+        role: 'user',
+        type: 'text',
+        content,
+        meta: { selectedNodeIds: sentNodeIds, nodeReferences },
+      },
       {
         id: turnId,
         role: 'assistant',
@@ -498,17 +509,13 @@ export function AgentPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content,
-          selectedNodeIds: [
-            ...new Set([
-              ...selectedNodes,
-              ...composerRefs.filter((r) => r.kind === 'node').map((r) => r.id),
-            ]),
-          ],
+          selectedNodeIds: sentNodeIds,
           canvasId: canvas?.canvas.id != null ? String(canvas.canvas.id) : undefined,
         }),
         signal: ac.signal,
       })
       if (!res.ok) throw new Error(`Agent 请求失败 (${res.status})`)
+      setComposerRefs((prev) => consumeSentNodeRefs(prev, new Set(sentNodeIds)))
       const reader = res.body?.getReader()
       const decoder = new TextDecoder()
       let buf = ''
@@ -625,9 +632,9 @@ export function AgentPanel() {
       {tab === 'chat' && (
         <div className="flex min-h-0 flex-1 flex-col bg-[var(--canvas-surface)]">
           <div className="relative min-h-0 flex-1 overflow-y-auto bg-transparent px-3.5 pb-8 pt-3.5">
-            {selectedNodes.length > 0 && (
+            {composerRefs.some((ref) => ref.kind === 'node') && (
               <p className="mb-3 rounded-full bg-[#f2f2f2] px-3 py-1.5 text-[11px] font-semibold text-[#555]">
-                已选中 {selectedNodes.length} 个节点，Agent 将基于这些节点操作
+                已加入 {composerRefs.filter((ref) => ref.kind === 'node').length} 个参考节点，将随下一条消息发送
               </p>
             )}
 
@@ -695,7 +702,10 @@ export function AgentPanel() {
                       )}
                     </>
                   ) : (
-                    m.content
+                    <>
+                      <AgentNodeReferenceCards references={m.meta?.nodeReferences ?? []} />
+                      <div className={m.meta?.nodeReferences?.length ? 'mt-2' : undefined}>{m.content}</div>
+                    </>
                   )}
                 </div>
               </div>

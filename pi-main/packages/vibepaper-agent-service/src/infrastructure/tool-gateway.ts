@@ -1,4 +1,8 @@
 import type { ServiceConfig } from "../config.ts";
+import {
+	selectNodeReferences,
+	type NodeReferenceSnapshot,
+} from "../application/node-reference-context.ts";
 
 export interface CanvasNodeRequest {
 	type: "image" | "video";
@@ -17,6 +21,26 @@ export class ToolGateway {
 
 	constructor(config: ServiceConfig) {
 		this.config = config;
+	}
+
+	async getNodeReferences(
+		userId: string,
+		canvasId: string,
+		nodeIds: readonly string[],
+	): Promise<NodeReferenceSnapshot[]> {
+		if (nodeIds.length === 0) return [];
+		const response = await fetch(`${this.config.canvasBaseUrl}/api/v1/canvases/${encodeURIComponent(canvasId)}`, {
+			method: "GET",
+			headers: requestHeaders(userId),
+			signal: AbortSignal.timeout(10_000),
+		});
+		const data = await responseData(response);
+		if (!response.ok) {
+			const code = response.status === 403 ? "PERMISSION_DENIED" : response.status === 404 ? "NOT_FOUND" : "CANVAS_UNAVAILABLE";
+			const statusCode = response.status === 403 || response.status === 404 ? response.status : 502;
+			throw new ToolGatewayError(code, "读取参考节点失败", data, statusCode);
+		}
+		return selectNodeReferences(arrayValue(objectValue(data).nodes), nodeIds);
 	}
 
 	async createCanvasNode(userId: string, canvasId: string, node: CanvasNodeRequest): Promise<CreatedCanvasNode> {
@@ -102,11 +126,17 @@ function objectId(value: unknown): string | undefined {
 export class ToolGatewayError extends Error {
 	readonly code: string;
 	readonly details: unknown;
+	readonly statusCode: number;
 
-	constructor(code: string, message: string, details: unknown) {
+	constructor(code: string, message: string, details: unknown, statusCode = 502) {
 		super(message);
 		this.name = "ToolGatewayError";
 		this.code = code;
 		this.details = details;
+		this.statusCode = statusCode;
 	}
+}
+
+function arrayValue(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : [];
 }

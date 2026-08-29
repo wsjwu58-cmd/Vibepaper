@@ -37,6 +37,17 @@ export interface AgentConfirmation {
   status?: 'pending' | 'submitting' | 'accepted' | 'rejected'
 }
 
+export interface AgentNodeReference {
+  nodeId: string
+  nodeType: string
+  creativeType?: string
+  title: string
+  status: string
+  previewUrl?: string
+  textContent?: string
+  prompt?: string
+}
+
 export interface AgentChatMsg {
   id: number | string
   role: string
@@ -50,6 +61,8 @@ export interface AgentChatMsg {
     loadedSkills?: string[]
     executionSteps?: ExecutionStep[]
     taskStatus?: { taskId?: string; status?: string; nodeId?: string; modelType?: string }
+    selectedNodeIds?: string[]
+    nodeReferences?: AgentNodeReference[]
     requiresConfirmation?: boolean
     confirmation?: AgentConfirmation
   }

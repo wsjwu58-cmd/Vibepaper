@@ -6,10 +6,16 @@ import type { ServiceConfig } from "../config.ts";
 import type { DramaStateStore } from "../domain/drama-state.ts";
 import { createDramaAgent } from "../pi/drama-agent.ts";
 import { createLoadSkillTool, type LoadedSkillResource } from "../tools/skill-tools.ts";
+import {
+	composeUserContent,
+	nodeReferencesFromMeta,
+	type NodeReferenceSnapshot,
+} from "./node-reference-context.ts";
 
 export interface StoredAgentMessage {
 	role: "user" | "assistant" | "system";
 	content: string;
+	meta: Record<string, unknown>;
 	createdAt: Date;
 }
 
@@ -50,6 +56,7 @@ export async function runDramaTurn(
 	history: readonly StoredAgentMessage[],
 	content: string,
 	skillContext: AgentSkillContext,
+	nodeReferences: readonly NodeReferenceSnapshot[] = [],
 ): Promise<{ events: AgentTurnEvent[]; assistantText: string; totalTokens: number }> {
 	if (!config.llmApiKey) {
 		throw new AgentRuntimeError("MODEL_UNAVAILABLE", "未配置 VIBEPAPER_LLM_API_KEY 或 VIBEPAPER_AGNES_API_KEY");
@@ -59,7 +66,7 @@ export async function runDramaTurn(
 		if (message.role === "user") {
 			initialMessages.push({
 				role: "user",
-				content: [{ type: "text", text: message.content }],
+				content: [{ type: "text", text: composeUserContent(message.content, nodeReferencesFromMeta(message.meta)) }],
 				timestamp: message.createdAt.getTime(),
 			});
 		}
@@ -110,7 +117,7 @@ export async function runDramaTurn(
 			},
 		);
 	});
-	await agent.prompt(content);
+	await agent.prompt(composeUserContent(content, nodeReferences));
 	return { events, assistantText, totalTokens };
 }
 

@@ -11,6 +11,11 @@ import {
 	runDramaTurn,
 	type StoredAgentMessage,
 } from "../application/agent-runtime.ts";
+import {
+	MAX_NODE_REFERENCES,
+	NodeReferenceContextError,
+	type NodeReferenceSnapshot,
+} from "../application/node-reference-context.ts";
 import type { ServiceConfig } from "../config.ts";
 import {
 	type CharacterProfile,
@@ -26,7 +31,7 @@ import { SYSTEM_SKILLS, skillIndexLine } from "../domain/skill-manifest.ts";
 import type { SqlExecutor } from "../infrastructure/database.ts";
 import { nextId } from "../infrastructure/ids.ts";
 import { PgDramaStateStore } from "../infrastructure/pg-drama-state-store.ts";
-import { ToolGateway } from "../infrastructure/tool-gateway.ts";
+import { ToolGateway, ToolGatewayError } from "../infrastructure/tool-gateway.ts";
 
 type SessionRow = {
 	id: string;
@@ -65,22 +70,53 @@ type FragmentRow = { id: string; title: string | null; canvas_id: string | null;
 export interface CreateAppOptions {
 	config: ServiceConfig;
 	database: SqlExecutor;
+	referenceGateway?: NodeReferenceGateway;
+	runTurn?: typeof runDramaTurn;
+}
+
+export interface NodeReferenceGateway {
+	getNodeReferences(
+		userId: string,
+		canvasId: string,
+		nodeIds: readonly string[],
+	): Promise<NodeReferenceSnapshot[]>;
 }
 
 export function createApp(options: CreateAppOptions): FastifyInstance {
 	const app = Fastify({ logger: true });
 	const { config, database } = options;
 	const dramaState = new PgDramaStateStore(database);
+	const referenceGateway = options.referenceGateway ?? new ToolGateway(config);
+	const runTurn = options.runTurn ?? runDramaTurn;
 	app.register(multipart, { limits: { fileSize: 512 * 1024, files: 1 } });
 
 	app.setErrorHandler((error, _request, reply) => {
-		const known = error instanceof DramaDomainError || error instanceof AgentRuntimeError;
-		const status = known ? 400 : isStatusError(error) ? error.statusCode : 500;
+		const domainError = error instanceof DramaDomainError || error instanceof AgentRuntimeError;
+		const referenceError = error instanceof NodeReferenceContextError;
+		const gatewayError = error instanceof ToolGatewayError;
+		const apiError = error instanceof ApiError;
+		const known = domainError || referenceError || gatewayError || apiError;
+		const status = referenceError
+			? error.code === "NOT_FOUND"
+				? 404
+				: 400
+			: gatewayError || apiError
+				? error.statusCode
+				: domainError
+					? 400
+					: isStatusError(error)
+						? error.statusCode
+						: 500;
+		const code = known && "code" in error && typeof error.code === "string"
+			? error.code
+			: status === 500
+				? "INTERNAL_ERROR"
+				: "INVALID_INPUT";
 		const message = error instanceof Error ? error.message : "未知服务错误";
 		void reply.status(status).send({
-			code: known ? error.code : status === 500 ? "INTERNAL_ERROR" : "INVALID_INPUT",
+			code,
 			message,
-			details: undefined,
+			details: gatewayError ? error.details : undefined,
 			request_id: reply.request.id,
 			retryable: status >= 500,
 		});
@@ -154,17 +190,29 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 			session = { ...session, canvas_id: requestedCanvas };
 		}
 		if (!session.canvas_id) throw new ApiError(400, "INVALID_INPUT", "会话未绑定画布，请在画布页重新打开 Agent");
-		const selectedNodeIds = stringArray(body.selectedNodeIds)
+		const selectedNodeIds = uniqueStrings(stringArray(body.selectedNodeIds)
 			.map((id) => optionalId(id))
-			.filter((id): id is string => id !== undefined);
-		await addMessage(database, sessionId, "user", content, { selectedNodeIds });
+			.filter((id): id is string => id !== undefined));
+		if (selectedNodeIds.length > MAX_NODE_REFERENCES) {
+			throw new NodeReferenceContextError("INVALID_INPUT", `每轮最多引用 ${MAX_NODE_REFERENCES} 个节点`);
+		}
+		const nodeReferences = await referenceGateway.getNodeReferences(userId, session.canvas_id, selectedNodeIds);
+		await addMessage(database, sessionId, "user", content, { selectedNodeIds, nodeReferences });
 		await database.query(
 			"UPDATE agent_sessions SET title = CASE WHEN title IN ('新对话', '画布对话') THEN $1 ELSE title END, updated_at = now() WHERE id = $2",
 			[content.slice(0, 48), sessionId],
 		);
 		const history = await readHistory(database, sessionId);
 		const skillContext = await resolveSkillContext(database, userId, sessionId);
-		const outcome = await runDramaTurn(config, dramaState, sessionId, history.slice(0, -1), content, skillContext);
+		const outcome = await runTurn(
+			config,
+			dramaState,
+			sessionId,
+			history.slice(0, -1),
+			content,
+			skillContext,
+			nodeReferences,
+		);
 		if (outcome.assistantText) await addMessage(database, sessionId, "assistant", outcome.assistantText, {});
 		await database.query(
 			`UPDATE agent_sessions SET token_used_total = token_used_total + $1,
@@ -703,6 +751,10 @@ function stringArray(value: unknown): string[] {
 	return value.map((item) => item.trim());
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+	return [...new Set(values)];
+}
+
 function bindings(value: unknown): ShotSpec["characterBindings"] {
 	if (!Array.isArray(value)) throw new ApiError(400, "INVALID_INPUT", "characterBindings 必须是数组");
 	return value.map((item) => {
@@ -782,7 +834,12 @@ async function readHistory(database: SqlExecutor, sessionId: string): Promise<St
 	);
 	return result.rows
 		.reverse()
-		.map((message) => ({ role: message.role, content: message.content, createdAt: message.created_at }));
+		.map((message) => ({
+			role: message.role,
+			content: message.content,
+			meta: objectOrEmpty(message.meta),
+			createdAt: message.created_at,
+		}));
 }
 
 async function addMessage(

@@ -3,30 +3,7 @@ import { resolveMediaUrl } from '@/lib/media'
 import { cn } from '@/lib/cn'
 import type { FlowNode } from './canvasStore'
 import type { NodePayload } from '@/lib/types'
-
-export type ComposerRef = {
-  id: string
-  kind: 'node' | 'skill'
-  nodeType?: string
-  title: string
-}
-
-export function refFromNode(node: NodePayload): ComposerRef {
-  const p = node.params || {}
-  const title = String(p.title || node.creativeType || node.type || '节点')
-  return { id: String(node.id), kind: 'node', nodeType: node.type, title }
-}
-
-export function upsertRefs(list: ComposerRef[], add: ComposerRef[], cap = 8): ComposerRef[] {
-  const out = [...list]
-  for (const item of add) {
-    if (!item.id) continue
-    const i = out.findIndex((x) => x.kind === item.kind && x.id === item.id)
-    if (i >= 0) out[i] = { ...out[i], ...item }
-    else out.push(item)
-  }
-  return out.slice(-cap)
-}
+import type { ComposerRef } from './agentNodeReferences'
 
 function previewOf(node: NodePayload | undefined): { url?: string; text?: string } {
   if (!node) return {}
