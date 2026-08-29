@@ -1,30 +1,18 @@
-"""轻量 schema 补丁：为已有库补齐记忆/Skill 相关列（无 Alembic 时）。"""
+"""Alembic 迁移入口：启动时升级到 head。"""
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from sqlalchemy import text
-
-from .db import engine
+from alembic import command
+from alembic.config import Config
 
 logger = logging.getLogger("agent.schema")
 
-_PATCHES = [
-    "ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS scope VARCHAR(16) DEFAULT 'long_term'",
-    "ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS embedding JSONB DEFAULT '[]'::jsonb",
-    "ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS last_merged_at TIMESTAMPTZ",
-    "ALTER TABLE session_fragments ADD COLUMN IF NOT EXISTS fragment_type VARCHAR(32) DEFAULT 'worldview'",
-    "ALTER TABLE session_fragments ADD COLUMN IF NOT EXISTS canvas_id BIGINT",
-    "ALTER TABLE skills ADD COLUMN IF NOT EXISTS category VARCHAR(32) DEFAULT 'general'",
-]
 
-
-def ensure_schema():
-    with engine.begin() as conn:
-        for sql in _PATCHES:
-            try:
-                conn.execute(text(sql))
-            except Exception as e:
-                logger.warning("schema patch skipped: %s (%s)", sql, e)
-    logger.info("agent schema patches applied")
+def ensure_schema() -> None:
+    root = Path(__file__).resolve().parents[3]
+    cfg = Config(str(root / "alembic.ini"))
+    command.upgrade(cfg, "head")
+    logger.info("agent alembic migrations applied")

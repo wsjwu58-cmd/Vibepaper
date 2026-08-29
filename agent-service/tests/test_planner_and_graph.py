@@ -178,5 +178,5 @@ def test_confirm_helpers():
 
     assert parse_confirm_intent("确认") == "accept"
     assert parse_confirm_intent("取消") == "cancel"
-    assert should_auto_confirm("根据图片生成2秒视频", "submit_generation") is True
+    assert should_auto_confirm("根据图片生成2秒视频", "submit_generation") is False
     assert should_auto_confirm("帮我看看画布", "submit_generation") is False

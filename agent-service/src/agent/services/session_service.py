@@ -140,32 +140,6 @@ class SessionService:
         self.add_message(db, session.id, "user", content, "text", {"selectedNodes": selected})
         self.rename_from_first_user_message(db, session, content)
 
-        from ..graph.confirm_helpers import parse_confirm_intent
-        from ..graph.app import try_resume_dialog_confirm
-
-        confirm_intent = parse_confirm_intent(content)
-        if confirm_intent:
-            resumed = try_resume_dialog_confirm(
-                session.id, session.user_id, accept=(confirm_intent == "accept"),
-            )
-            if resumed is not None:
-                for e in resumed:
-                    if e.get("type") == "assistant_message" and e.get("content"):
-                        self.add_message(
-                            db, session.id, "assistant", e.get("content") or "",
-                            msg_type="text",
-                            meta={
-                                "replyType": e.get("replyType"),
-                                "pipelineStage": e.get("pipelineStage"),
-                                "suggestions": e.get("suggestions"),
-                                "nextActions": e.get("nextActions"),
-                                "executionSteps": e.get("executionSteps"),
-                            },
-                        )
-                session.updated_at = datetime.now(timezone.utc)
-                db.commit()
-                return resumed
-
         from ..graph.app import run_agent_turn
         events = run_agent_turn(
             session_id=session.id,
@@ -264,6 +238,7 @@ class SessionService:
         from ..graph.app import resume_agent_confirm
         return resume_agent_confirm(
             session_id, user_id, action_id, accept,
+            approval_token=token,
             confirmed_action=confirmed_action if isinstance(confirmed_action, dict) else None,
         )
 

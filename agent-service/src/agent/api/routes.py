@@ -1,3 +1,4 @@
+import hmac
 import json
 import time
 
@@ -9,6 +10,8 @@ from ..core.config import settings
 from ..core.db import get_db
 from ..models import SessionFragment
 from ..services.memory_service import memory_service
+from ..services.plan_query import get_plan_summary
+from ..services.review_service import ReviewValidationError, review_service
 from ..services.session_service import session_service
 from ..services.skill_service import skill_service
 
@@ -139,7 +142,7 @@ def confirm(request: Request, session_id: str, action_id: str, body: dict, db: S
         )
     result = session_service.confirm(
         db, sid, uid, aid,
-        body.get("token", ""),
+        body.get("approvalToken") or body.get("token", ""),
         bool(body.get("accept", False)),
         confirmed_action=body.get("confirmedAction") or body.get("confirmed_action") or body.get("params"),
     )
@@ -153,6 +156,62 @@ def confirm(request: Request, session_id: str, action_id: str, body: dict, db: S
             },
         )
     return result
+
+
+@router.get("/api/v1/agent/sessions/{session_id}/plans/{plan_version}")
+def get_plan(request: Request, session_id: int, plan_version: int, db: Session = Depends(get_db)):
+    uid = user_id(request)
+    session = session_service.get_session(db, session_id, uid)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if plan_version <= 0:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "planVersion 非法", "retryable": False})
+    return get_plan_summary(db, session, plan_version)
+
+
+@router.post("/internal/agent/resume")
+def resume_from_generation(request: Request, body: dict, db: Session = Depends(get_db)):
+    """消费 generation-service 终态事件；仅限服务间调用且幂等。"""
+    expected = (settings.internal_service_token or "").strip()
+    supplied = request.headers.get("X-Internal-Service-Token", "")
+    if expected:
+        if not hmac.compare_digest(supplied, expected):
+            raise HTTPException(status_code=403, detail="内部服务鉴权失败")
+    elif (settings.environment or "").lower() == "production":
+        raise HTTPException(status_code=503, detail="未配置内部服务令牌")
+
+    from ..services.resume_service import consume_terminal_event
+
+    result = consume_terminal_event(db, body)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": result.get("error_code") or "INVALID_INPUT",
+                "message": result.get("message") or "终态事件无效",
+                "retryable": False,
+            },
+        )
+    return result
+
+
+@router.post("/api/v1/render-reviews")
+def create_render_review(request: Request, body: dict, db: Session = Depends(get_db)):
+    uid = user_id(request)
+    try:
+        return review_service.record(db, uid, body)
+    except ReviewValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_INPUT", "message": str(exc), "retryable": False},
+        ) from exc
+
+
+@router.get("/api/v1/render-reviews")
+def list_render_reviews(request: Request, canvasId: int, targetNodeId: int | None = None,
+                        db: Session = Depends(get_db)):
+    uid = user_id(request)
+    return {"items": review_service.list(db, uid, canvasId, targetNodeId)}
 
 
 @router.get("/api/v1/agent/sessions/{session_id}/usage")

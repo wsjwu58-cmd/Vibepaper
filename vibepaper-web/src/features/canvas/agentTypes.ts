@@ -19,6 +19,35 @@ export interface AgentSuggestion {
   nodeParams?: Record<string, unknown>
 }
 
+/** 高风险 Agent 动作必须通过此卡片确认；令牌绑定用户、画布版本和动作摘要。 */
+export interface AgentConfirmation {
+  actionId: string
+  approvalToken: string
+  tool?: string
+  summary: string
+  confirmReason?: string
+  estimatedCost?: number
+  chainEstimatedCost?: number
+  estimatedTotalCost?: number
+  approvedCostCap?: number
+  affectedNodeCount?: number
+  canvasVersion?: number
+  planVersion?: number
+  expiresAt?: string
+  status?: 'pending' | 'submitting' | 'accepted' | 'rejected'
+}
+
+export interface AgentNodeReference {
+  nodeId: string
+  nodeType: string
+  creativeType?: string
+  title: string
+  status: string
+  previewUrl?: string
+  textContent?: string
+  prompt?: string
+}
+
 export interface AgentChatMsg {
   id: number | string
   role: string
@@ -32,7 +61,10 @@ export interface AgentChatMsg {
     loadedSkills?: string[]
     executionSteps?: ExecutionStep[]
     taskStatus?: { taskId?: string; status?: string; nodeId?: string; modelType?: string }
+    selectedNodeIds?: string[]
+    nodeReferences?: AgentNodeReference[]
     requiresConfirmation?: boolean
+    confirmation?: AgentConfirmation
   }
 }
 

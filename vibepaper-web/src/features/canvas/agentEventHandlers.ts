@@ -1,4 +1,4 @@
-import type { AgentChatMsg, ExecutionStep } from './agentTypes'
+import type { AgentChatMsg, AgentConfirmation, ExecutionStep } from './agentTypes'
 import { stepFromPlan, stepFromResult, stepFromSpeech, stepFromThinking, toolLabel } from './agentTypes'
 
 function stripEmbeddedReactJson(text: string): string {
@@ -71,6 +71,7 @@ export function isChatVisibleMessage(m: AgentChatMsg): boolean {
   if (m.type && m.type !== 'text') return false
   if (m.content?.trim()) return true
   if ((m.meta?.executionSteps?.length ?? 0) > 0) return true
+  if (m.meta?.confirmation) return true
   return false
 }
 
@@ -93,6 +94,32 @@ export function applyAgentEvent(
   ev: Record<string, unknown>,
   turnId: string | null,
 ): AgentChatMsg[] {
+  if (ev.type === 'confirm_required') {
+    const actionId = String(ev.actionId ?? '')
+    const approvalToken = String(ev.approvalToken ?? ev.token ?? '')
+    if (!actionId || !approvalToken) return messages
+    const confirmation: AgentConfirmation = {
+      actionId,
+      approvalToken,
+      tool: typeof ev.tool === 'string' ? ev.tool : undefined,
+      summary: String(ev.summary ?? ev.tool ?? '待确认操作'),
+      confirmReason: typeof ev.confirmReason === 'string' ? ev.confirmReason : undefined,
+      estimatedCost: Number(ev.estimatedCost ?? 0) || 0,
+      chainEstimatedCost: Number(ev.chainEstimatedCost ?? 0) || 0,
+      estimatedTotalCost: Number(ev.estimatedTotalCost ?? ev.estimatedCost ?? 0) || 0,
+      approvedCostCap: Number(ev.approvedCostCap ?? 0) || 0,
+      affectedNodeCount: Number(ev.affectedNodeCount ?? 0) || 0,
+      canvasVersion: Number(ev.canvasVersion ?? 0) || undefined,
+      planVersion: Number(ev.planVersion ?? 0) || undefined,
+      expiresAt: typeof ev.expiresAt === 'string' ? ev.expiresAt : undefined,
+      status: 'pending',
+    }
+    return patchLastAssistant(messages, (m) => ({
+      ...m,
+      meta: { ...m.meta, requiresConfirmation: true, confirmation },
+    }))
+  }
+
   if (ev.type === 'thinking' || ev.type === 'reflection') {
     const content = stripEmbeddedReactJson(String(ev.content ?? ev.note ?? '').trim())
     if (!content) return messages

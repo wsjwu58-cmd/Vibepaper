@@ -57,6 +57,15 @@ public final class CanvasDtos {
     public record ShareRequest(@NotBlank String visibility) {
     }
 
+    public record UpsertDramaAssetRequest(@NotBlank String assetType, Long assetId,
+                                          @NotNull Integer canvasVersion, @NotNull Map<String, Object> data) {
+    }
+
+    public record DramaAssetPayload(Long id, Long canvasId, String assetType, Integer assetVersion,
+                                    Integer canvasVersion, Integer currentCanvasVersion, Map<String, Object> data,
+                                    Boolean replayed, String createdAt, String updatedAt) {
+    }
+
     public record CanvasView(Long id, Long ownerId, String name, String description, String schemaVersion,
                              Integer version, String thumbnailUrl, String visibility, String shareToken,
                              String createdAt, String updatedAt) {

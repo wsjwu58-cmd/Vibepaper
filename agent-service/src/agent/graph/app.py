@@ -412,7 +412,10 @@ def _events_from_graph_result(result: Any, initial: list[dict] | None = None) ->
 
 
 def try_resume_dialog_confirm(session_id: int, user_id: int, accept: bool) -> list[dict] | None:
-    """用户于对话中回复「确认/取消」时续跑 LangGraph（HITL 恢复，不重跑整图）。"""
+    """废弃的对话确认入口：高风险操作只能由确认卡 API 恢复。"""
+    return None
+
+    # 下面保留旧实现仅供历史 checkpoint 排障阅读；return 后不会执行。
     graph = get_agent_graph()
     config = _config(session_id)
 
@@ -493,19 +496,13 @@ def run_agent_turn(
     from .confirm_helpers import parse_confirm_intent
     from .state import reset_events, reset_executed_results
 
-    # HITL：纯确认/取消文本优先恢复 interrupt，绝不整图重跑
+    # 高风险操作不能由聊天文字确认或取消；只能消费确认卡的一次性令牌。
     confirm_intent = parse_confirm_intent(content)
     if confirm_intent:
-        resumed = try_resume_dialog_confirm(
-            session_id, user_id, accept=(confirm_intent == "accept"),
-        )
-        if resumed is not None:
-            return resumed
-        # 无挂起确认：提示用户，避免把「确认」当新创作指令
         return [
             {
                 "type": "assistant_message",
-                "content": "当前没有待确认的操作。请重新描述你想做的事，或点选下一步建议。",
+                "content": "高风险操作必须在确认卡片中确认或取消；普通聊天文本不会触发执行。",
             },
             {"type": "done"},
         ]
@@ -513,16 +510,21 @@ def run_agent_turn(
     graph = get_agent_graph()
     config = _config(session_id)
 
-    # 若上一轮卡在 confirmer interrupt，而本轮不是「确认/取消」文本，
-    # 先取消中断，否则同 thread 再 invoke 会与挂起态冲突。
+    # 有待确认动作时，拒绝继续在同一 checkpoint 规划，避免新指令隐式取消或
+    # 绕过签名令牌恢复。
     try:
         snap = graph.get_state(config)
         if snap and snap.next and "confirmer" in (snap.next or ()):
-            aid = find_pending_confirm_action_id(session_id)
-            if aid:
-                resume_agent_confirm(session_id, user_id, aid, accept=False)
+            return [
+                {
+                    "type": "assistant_message",
+                    "content": "当前有待确认的高风险操作，请先在确认卡片中确认或取消后再继续。",
+                    "requiresConfirmationCard": True,
+                },
+                {"type": "done"},
+            ]
     except Exception:
-        logger.warning("clear stale confirmer interrupt failed session=%s", session_id, exc_info=True)
+        logger.warning("read pending confirmer interrupt failed session=%s", session_id, exc_info=True)
 
     initial: AgentState = {
         "session_id": session_id,
@@ -597,7 +599,7 @@ def run_agent_turn(
             if isinstance(payload, dict):
                 events.append(payload if payload.get("type") else {**payload, "type": "confirm_required"})
             from .confirm_helpers import build_dialog_confirm_prompt
-            prompt = "请在对话中回复「确认」继续，或「取消」放弃。"
+            prompt = "请在确认卡片中确认或取消；普通聊天文本不能替代确认。"
             if isinstance(payload, dict) and payload.get("summary"):
                 prompt = build_dialog_confirm_prompt({
                     "tool_name": payload.get("tool"),
@@ -607,7 +609,7 @@ def run_agent_turn(
             events.append({
                 "type": "assistant_message",
                 "content": prompt,
-                "requiresDialogConfirm": True,
+                "requiresConfirmationCard": True,
             })
             events.append({"type": "done"})
             return events
@@ -652,11 +654,11 @@ def run_agent_turn(
                         "params": {"estimated_cost": confirm_ev.get("estimatedCost") or 0},
                     }, chain_cost=int(confirm_ev.get("chainEstimatedCost") or 0))
                 else:
-                    prompt = "请在对话中回复「确认」继续，或「取消」放弃。"
+                    prompt = "请在确认卡片中确认或取消；普通聊天文本不能替代确认。"
                 events.append({
                     "type": "assistant_message",
                     "content": prompt,
-                    "requiresDialogConfirm": True,
+                    "requiresConfirmationCard": True,
                 })
 
     # usage
@@ -677,12 +679,19 @@ def resume_agent_confirm(
     user_id: int,
     action_id: int,
     accept: bool,
+    approval_token: str | None = None,
     expected_canvas_version: int | None = None,
     confirmed_action: dict | None = None,
 ) -> dict:
     """从 checkpoint resume 确认。"""
     from ..core.db import SessionLocal
     from ..models import AgentAction, AgentSession
+    from ..domain.approval import compute_action_hash
+    from ..services.approval_service import (
+        ApprovalError,
+        consume_approval,
+        mark_action_approved,
+    )
     from ..services.telemetry import agent_confirm_accept, agent_confirm_reject
     from ..tools.registry import headers_for
     import httpx
@@ -690,19 +699,9 @@ def resume_agent_confirm(
     graph = get_agent_graph()
     config = _config(session_id)
 
-    # action_id<=0：仅恢复 interrupt，不依赖 DB 行（HITL 兜底）
+    # 不允许缺少 Action/令牌的 checkpoint 兜底恢复，否则会绕过审批。
     if int(action_id or 0) <= 0:
-        try:
-            snap = graph.get_state(config)
-            if not (snap and snap.next and "confirmer" in (snap.next or ())):
-                return {"ok": False, "error": "没有待确认的操作"}
-            result = graph.invoke(
-                Command(resume={"accept": bool(accept), "actionId": 0}),
-                config=config,
-            )
-            return {"ok": True, "result": result if isinstance(result, dict) else {}}
-        except Exception as exc:
-            return {"ok": False, "error": f"确认恢复失败：{str(exc)[:120]}"}
+        return {"ok": False, "error": "确认记录不存在", "error_code": "CONFIRMATION_REQUIRED"}
 
     db = SessionLocal()
     try:
@@ -711,20 +710,21 @@ def resume_agent_confirm(
             return {"ok": False, "error": "会话不存在"}
         record = db.get(AgentAction, action_id)
         if not record or record.session_id != session_id:
-            # DB 丢失时仍尝试 checkpoint resume
-            try:
-                snap = graph.get_state(config)
-                if snap and snap.next and "confirmer" in (snap.next or ()):
-                    result = graph.invoke(
-                        Command(resume={"accept": bool(accept), "actionId": action_id}),
-                        config=config,
-                    )
-                    return {"ok": True, "result": result if isinstance(result, dict) else {}}
-            except Exception:
-                pass
-            return {"ok": False, "error": "确认记录不存在"}
+            return {"ok": False, "error": "确认记录不存在", "error_code": "CONFIRMATION_REQUIRED"}
+
+        if not (approval_token or "").strip():
+            return {"ok": False, "error": "缺少确认令牌", "error_code": "CONFIRMATION_REQUIRED"}
+
+        # 卡片编辑参数会改变动作摘要；必须重新规划并签发新的确认，不能复用旧 token。
+        if confirmed_action and isinstance(confirmed_action, dict):
+            return {
+                "ok": False,
+                "error": "确认参数已变化，请重新发送指令以获取新的确认卡片",
+                "error_code": "VERSION_CONFLICT",
+            }
 
         # checkpoint TTL：中断超过 5 分钟则确认失效
+        event_watermark = 0
         try:
             from datetime import datetime, timezone
             snap = graph.get_state(config)
@@ -739,10 +739,13 @@ def resume_agent_confirm(
                         "error": "确认已超时，请重新发送指令",
                         "error_code": "CONFIRM_EXPIRED",
                     }
+            if snap and isinstance(getattr(snap, "values", None), dict):
+                event_watermark = len(snap.values.get("events") or [])
         except Exception:
             pass
 
-        # 画布版本校验
+        current_canvas_version = int(record.canvas_version or 0)
+        # 画布版本是令牌绑定的一部分。无法读取最新版本时默认拒绝，而非放行旧审批。
         if session.canvas_id:
             try:
                 r = httpx.get(
@@ -751,17 +754,36 @@ def resume_agent_confirm(
                     timeout=8,
                     trust_env=False,
                 )
-                if r.status_code == 200:
-                    current_ver = int(r.json().get("version") or 0)
-                    stored = int(record.canvas_version or 0)
-                    if stored and current_ver and current_ver != stored:
-                        return {"ok": False, "error": "画布版本已变化，请刷新后重新发送指令",
-                                "error_code": "VERSION_CONFLICT"}
             except Exception:
-                pass
+                return {"ok": False, "error": "无法校验画布版本，请稍后重试", "error_code": "CANVAS_UNAVAILABLE"}
+            if r.status_code != 200:
+                return {"ok": False, "error": "无法校验画布版本，请稍后重试", "error_code": "CANVAS_UNAVAILABLE"}
+            current_canvas_version = int(r.json().get("version") or 0)
+
+        action_hash = compute_action_hash(
+            record.tool_name or "",
+            record.params or {},
+            int(record.approved_cost_cap or 0),
+        )
+        try:
+            approval = consume_approval(
+                db,
+                token=approval_token,
+                user_id=user_id,
+                session_id=session_id,
+                action_id=action_id,
+                canvas_id=session.canvas_id,
+                canvas_version=current_canvas_version or None,
+                plan_version=int(record.plan_version or 1),
+                action_hash=action_hash,
+                accept=accept,
+            )
+        except ApprovalError as exc:
+            db.rollback()
+            return {"ok": False, "error": exc.message, "error_code": exc.code}
 
         if not accept:
-            record.status = "cancelled"
+            record.status = "rejected"
             db.commit()
             agent_confirm_reject(session_id, record.tool_name or "")
             # 仍 resume 以结束图
@@ -769,22 +791,34 @@ def resume_agent_confirm(
                 graph.invoke(Command(resume={"accept": False, "actionId": action_id}), config=config)
             except Exception:
                 pass
-            return {"ok": True, "cancelled": True}
+            return {
+                "ok": True,
+                "cancelled": True,
+                "events": [{"type": "assistant_message", "content": "已取消操作。"}],
+            }
 
-        # 确认卡手改配置：写入动作参数并随 resume 下发
-        if confirmed_action and isinstance(confirmed_action, dict):
-            from ..domain.precedence import apply_confirmed_action
-            merged = apply_confirmed_action(record.params or {}, confirmed_action)
-            record.params = merged
-            db.commit()
-
-        agent_confirm_accept(session_id, record.tool_name or "")
-        resume_payload: dict = {"accept": True, "actionId": action_id}
-        if confirmed_action and isinstance(confirmed_action, dict):
-            resume_payload["confirmedAction"] = confirmed_action
-        result = graph.invoke(Command(resume=resume_payload), config=config)
-        record.status = "executed"
+        mark_action_approved(db, record, approval)
         db.commit()
-        return {"ok": True, "result": result if isinstance(result, dict) else {}}
+        agent_confirm_accept(session_id, record.tool_name or "")
+        result = graph.invoke(Command(resume={"accept": True, "actionId": action_id}), config=config)
+        # executor 会把同步动作标为 executed、异步生成标为 waiting_terminal；此处
+        # 不得覆盖它的真实执行状态。
+        graph_result = result if isinstance(result, dict) else {}
+        all_events = list(graph_result.get("events") or [])
+        delta = all_events[event_watermark:] if event_watermark and len(all_events) >= event_watermark else all_events
+        keep_types = {
+            "inline_confirm", "action_result", "assistant_message", "confirm_required",
+            "usage", "task_status", "clock_scheduled", "contract_blocked",
+        }
+        events = [
+            event for event in delta
+            if isinstance(event, dict)
+            and not event.get("__replace_events__")
+            and not event.get("__replace_results__")
+            and event.get("type") in keep_types
+        ]
+        if not any(event.get("type") == "assistant_message" for event in events):
+            events.append({"type": "assistant_message", "content": "已确认并继续执行。"})
+        return {"ok": True, "events": events}
     finally:
         db.close()

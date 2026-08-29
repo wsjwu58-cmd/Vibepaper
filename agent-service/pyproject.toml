@@ -17,6 +17,7 @@ dependencies = [
     "celery>=5.4",
     "langgraph>=0.2",
     "langgraph-checkpoint-postgres>=2.0",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]

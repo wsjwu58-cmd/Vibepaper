@@ -13,8 +13,10 @@ from typing import Optional
 
 import redis
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from ..core.config import settings
+from ..domain.hashed_embedding import cosine_similarity, hashed_embedding
 from ..models import SessionFragment, UserMemory
 from .session_service import session_service
 
@@ -29,23 +31,12 @@ DEDUP_SIMILARITY_THRESHOLD = 0.85
 
 
 def _simple_vector(text: str) -> list[float]:
-    tokens = re.findall(r"[\u4e00-\u9fff]{1,2}|[a-zA-Z0-9]{2,}", text.lower())
-    freq: dict[str, int] = {}
-    for t in tokens:
-        freq[t] = freq.get(t, 0) + 1
-    return [float(v) for _, v in sorted(freq.items())[:64]]
+    """兼容旧函数名；返回带稳定词维度的归一化向量。"""
+    return hashed_embedding(text)
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if not a or not b:
-        return 0.0
-    min_len = min(len(a), len(b))
-    dot = sum(x * y for x, y in zip(a[:min_len], b[:min_len]))
-    norm_a = sum(x * x for x in a[:min_len]) ** 0.5
-    norm_b = sum(x * x for x in b[:min_len]) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+    return cosine_similarity(a, b)
 
 
 class MemoryService:
@@ -64,9 +55,15 @@ class MemoryService:
 
     def list_long_term(self, db: Session, user_id: int):
         """读取长期记忆（跨画布偏好）。"""
+        now = datetime.now(timezone.utc)
         return (
             db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id, UserMemory.scope == "long_term")
+            .filter(
+                UserMemory.user_id == user_id,
+                UserMemory.scope == "long_term",
+                UserMemory.deleted.is_(False),
+                or_(UserMemory.expires_at.is_(None), UserMemory.expires_at > now),
+            )
             .order_by(UserMemory.created_at.desc())
             .all()
         )
@@ -308,9 +305,9 @@ class MemoryService:
 
     def delete(self, db: Session, memory_id: int, user_id: int) -> bool:
         mem = db.get(UserMemory, memory_id)
-        if not mem or mem.user_id != user_id:
+        if not mem or mem.user_id != user_id or mem.deleted:
             return False
-        db.delete(mem)
+        mem.deleted = True
         db.commit()
         return True
 

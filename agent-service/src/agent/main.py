@@ -14,7 +14,7 @@ _registrar = NacosRegistrar("agent-service", settings.port)
 
 
 async def _clock_scan_loop(stop: asyncio.Event) -> None:
-    """进程内扫描 clock 任务：不依赖独立 Celery Beat 也能推进下游自动提交。"""
+    """开发可选：生产默认仅 Celery Beat 扫描 clock。"""
     while not stop.is_set():
         try:
             from .workers.celery_app import scan_clock_jobs
@@ -34,7 +34,6 @@ async def lifespan(app: FastAPI):
         ensure_schema()
     except Exception:
         logger.exception("schema migrate failed")
-    # 预热 LangGraph + 内置 Skill
     try:
         from .graph.app import get_agent_graph
         get_agent_graph()
@@ -51,22 +50,26 @@ async def lifespan(app: FastAPI):
         db.close()
     _registrar.start()
     stop = asyncio.Event()
-    clock_task = asyncio.create_task(_clock_scan_loop(stop))
-    logger.info("inline clock scanner started")
+    clock_task = None
+    if settings.inline_clock_scan_enabled:
+        clock_task = asyncio.create_task(_clock_scan_loop(stop))
+        logger.info("inline clock scanner started (dev only)")
+    else:
+        logger.info("inline clock scanner disabled; use Celery Beat")
     try:
         yield
     finally:
         stop.set()
-        clock_task.cancel()
-        try:
-            await clock_task
-        except asyncio.CancelledError:
-            pass
+        if clock_task is not None:
+            clock_task.cancel()
+            try:
+                await clock_task
+            except asyncio.CancelledError:
+                pass
         _registrar.stop()
 
 
 app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
-# CORS is handled solely by vibepaper-gateway to avoid duplicate Allow-Origin headers
 app.include_router(router)
 
 
