@@ -15,6 +15,8 @@ from ..core.config import settings
 from ..domain.task_states import TaskStateError, transition
 from ..models import GenerationTask, ModelConfig, PricingRule, TaskAttempt, TaskOutput
 from ..providers.providers import GenerationRequest, get_provider
+from .agent_terminal_callback import build_agent_terminal_callback
+from .model_resolve import resolve_model_config
 
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True, protocol=2)
 _id_seq = itertools.count(1)
@@ -36,9 +38,14 @@ def publish_event(task_id, event: dict):
 
 class TaskService:
     def estimate(self, db: Session, model_type: str, model_params: dict, count: int = 1) -> dict:
-        models = db.query(ModelConfig).filter(
-            ModelConfig.model_type == model_type, ModelConfig.enabled == True  # noqa: E712
-        ).all()
+        requested = (model_type or "").strip()
+        exact = resolve_model_config(db, requested)
+        if exact and exact.enabled:
+            models = [exact]
+        else:
+            models = db.query(ModelConfig).filter(
+                ModelConfig.model_type == requested, ModelConfig.enabled == True  # noqa: E712
+            ).all()
         if not models:
             return {"estimatedCost": None, "models": []}
         results = []
@@ -358,52 +365,67 @@ class TaskService:
             if output:
                 body["output"] = output
         try:
-            httpx.put(
-                f"{settings.canvas_base_url}/api/v1/canvases/{canvas_id}/nodes/{node_id}",
-                headers={
-                    "X-User-Id": str(user_id),
-                    "X-User-Role": "user",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=5,
-                trust_env=False,
-            )
+            headers = {
+                "X-User-Id": str(user_id),
+                "X-User-Role": "user",
+                "Content-Type": "application/json",
+                "Idempotency-Key": f"generation-terminal:{task.id}:{status}",
+            }
+            canvas_url = f"{settings.canvas_base_url}/api/v1/canvases/{canvas_id}"
+            # Reading the version and writing the node is a TOCTOU pair. Batch
+            # completions can race each other, so a single 409 must not drop a
+            # terminal node update; re-read the authoritative version and retry
+            # with the same idempotency key.
+            for attempt in range(5):
+                current = httpx.get(canvas_url, headers=headers, timeout=5, trust_env=False)
+                current.raise_for_status()
+                current_body = current.json()
+                canvas = current_body.get("canvas") if isinstance(current_body, dict) else None
+                version = canvas.get("version") if isinstance(canvas, dict) else None
+                if isinstance(version, int):
+                    body["expectedVersion"] = version
+                response = httpx.put(
+                    f"{canvas_url}/nodes/{node_id}",
+                    headers=headers,
+                    json=body,
+                    timeout=5,
+                    trust_env=False,
+                )
+                if response.status_code == 409 and attempt < 4:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+                break
         except Exception as e:
             print(f"[warn] notify canvas failed: {e}")
         # 终态事件唤醒 Agent（主路径）；clock 仅作长延迟兜底
         if status in ("succeeded", "failed", "cancelled", "expired", "settlement_error"):
-            self.notify_agent_resume(task, status)
+            self.notify_agent_resume(task, status, outputs)
 
-    def notify_agent_resume(self, task: GenerationTask, status: str) -> None:
+    def notify_agent_resume(self, task: GenerationTask, status: str, outputs: list | None = None) -> None:
         """HTTP 回调 agent-service：generation_terminal → resume。"""
         if status not in ("succeeded", "failed", "cancelled", "expired", "settlement_error"):
             return
-        base = (settings.agent_base_url or "").rstrip("/")
-        if not base:
-            return
         try:
-            headers = {}
-            if (settings.internal_service_token or "").strip():
-                headers["X-Internal-Service-Token"] = settings.internal_service_token.strip()
-            httpx.post(
-                f"{base}/internal/agent/resume",
-                headers=headers,
-                json={
-                    "type": "generation_terminal",
-                    "task_id": task.id,
-                    "taskId": task.id,
-                    "node_id": task.node_id,
-                    "canvas_id": task.canvas_id,
-                    "user_id": task.user_id,
-                    "status": status,
-                    "error_code": task.error_code,
-                    "model_type": task.model_type,
-                },
-                timeout=8,
-                trust_env=False,
+            request = build_agent_terminal_callback(
+                settings.agent_base_url,
+                task,
+                status,
+                settings.environment,
+                settings.internal_service_token,
+                outputs,
             )
+            if request is None:
+                return
+            if request["headers"]:
+                response = httpx.post(**request, timeout=8, trust_env=False)
+            else:
+                response = httpx.post(request["url"], json=request["json"], timeout=8, trust_env=False)
+            if not 200 <= response.status_code < 300:
+                raise RuntimeError(f"AGENT_CALLBACK_FAILED:{response.status_code}")
         except Exception as e:
+            if settings.environment in {"production", "staging"}:
+                raise
             print(f"[warn] notify agent resume failed: {e}")
 
     def notify_billing(self, task_id, action, payload):

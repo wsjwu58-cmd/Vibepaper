@@ -65,6 +65,8 @@ export interface AgentChatMsg {
     nodeReferences?: AgentNodeReference[]
     requiresConfirmation?: boolean
     confirmation?: AgentConfirmation
+    errorCode?: string
+    runStatus?: string
   }
 }
 

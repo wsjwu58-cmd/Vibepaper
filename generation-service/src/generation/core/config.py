@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     admin_base_url: str = "http://localhost:8087"
     canvas_base_url: str = "http://localhost:8082"
     agent_base_url: str = "http://localhost:8091"
+    environment: str = "development"
     internal_service_token: str = ""
     nacos_addr: str = "192.168.141.129:8848"
     nacos_username: str = "nacos"
@@ -32,9 +33,9 @@ class Settings(BaseSettings):
     # Agnes AI：图像 / 视频生成（https://apihub.agnes-ai.com/v1）
     agnes_api_key: str = ""
     agnes_base_url: str = "https://apihub.agnes-ai.com/v1"
-    agnes_image_model: str = "agnes-image-2.1-flash"
+    agnes_image_model: str = "agnes-image-2.5-flash"
     agnes_image_size: str = "2K"
-    agnes_video_model: str = "agnes-video-v2.0"
+    agnes_video_model: str = "agnes-video-2.5-flash"
     agnes_video_duration: int = 5
     # Agnes 状态查询有频率限制；过短会触发 HTTP 429
     agnes_poll_interval_seconds: int = 10

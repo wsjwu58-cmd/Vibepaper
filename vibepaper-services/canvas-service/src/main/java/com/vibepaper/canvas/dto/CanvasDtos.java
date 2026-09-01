@@ -40,18 +40,19 @@ public final class CanvasDtos {
 
     public record CreateNodeRequest(@NotBlank String type, Double x, Double y, Double width, Double height,
                                     Map<String, Object> params, String creativeType,
-                                    String modelRef, String prompt) {
+                                    String modelRef, String prompt, Integer expectedVersion) {
     }
 
     public record UpdateNodeRequest(Double x, Double y, Double width, Double height,
                                     Map<String, Object> params, String status, Long currentOutputId,
                                     Long groupId, Long stackId, String creativeType, Boolean stale,
-                                    String modelRef, String prompt, Map<String, Object> output, String execStatus) {
+                                    String modelRef, String prompt, Map<String, Object> output, String execStatus,
+                                    Integer expectedVersion) {
     }
 
     public record CreateEdgeRequest(@NotNull Long sourceNodeId, String sourcePort,
                                     @NotNull Long targetNodeId, String targetPort,
-                                    String dependencyType) {
+                                    String dependencyType, Integer expectedVersion) {
     }
 
     public record ShareRequest(@NotBlank String visibility) {

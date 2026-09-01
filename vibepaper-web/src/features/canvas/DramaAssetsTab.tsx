@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { Pencil, Plus, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
+import { DramaAuditPanel } from './DramaAuditPanel'
+import { DramaProductionPanel } from './DramaProductionPanel'
 
 type DramaAssetType =
   | 'series_bible'
@@ -221,6 +223,8 @@ export function DramaAssetsTab({
             ))}
           </div>
         </div>
+        <DramaProductionPanel canvasId={canvasId} />
+        <DramaAuditPanel canvasId={canvasId} />
       </div>
     </div>
   )

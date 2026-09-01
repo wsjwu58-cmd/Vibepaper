@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-	NodeReferenceContextError,
 	composeUserContent,
+	NodeReferenceContextError,
 	nodeReferencesFromMeta,
 	selectNodeReferences,
 } from "../src/application/node-reference-context.ts";
@@ -61,9 +61,12 @@ describe("node reference context", () => {
 	});
 
 	it("rejects more than eight references", () => {
-		expect(() => selectNodeReferences(nodes, Array.from({ length: 9 }, (_, index) => String(index + 1)))).toThrow(
-			"最多引用 8 个节点",
-		);
+		expect(() =>
+			selectNodeReferences(
+				nodes,
+				Array.from({ length: 9 }, (_, index) => String(index + 1)),
+			),
+		).toThrow("最多引用 8 个节点");
 	});
 
 	it("labels selected node content as untrusted data", () => {

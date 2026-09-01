@@ -10,6 +10,7 @@ import { useCanvasStore, nodeMediaUrl, type FlowNode } from '../canvasStore'
 import { NODE_COLORS, statusBadge } from './NodeShell'
 import { NodeEditorDialog, NodeFloatingToolbar } from './NodeEditorPanel'
 import { SplitNodeLayout } from './SplitNodeLayout'
+import { textNodeContent } from './textContent'
 import { persistNodeExec, submitNodeTask, syncExecFields } from './taskActions'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
 import { DirectorNodeView } from '../director'
@@ -425,11 +426,11 @@ const TextNodeView = memo(function TextNodeView(props: NodeProps<FlowNode>) {
   const { tasks, latest } = useNodeTasks(nodeId)
   const [outputDraft, setOutputDraft] = useState('')
 
-  const outputText = String(latest?.outputs?.[0]?.meta?.text ?? node?.params.lastOutputText ?? '')
+  const outputText = textNodeContent(latest?.outputs?.[0]?.meta?.text, node?.params)
 
   useEffect(() => {
-    setOutputDraft(String(latest?.outputs?.[0]?.meta?.text ?? node?.params.lastOutputText ?? ''))
-  }, [latest?.outputs, node?.params.lastOutputText, nodeId])
+    setOutputDraft(textNodeContent(latest?.outputs?.[0]?.meta?.text, node?.params))
+  }, [latest?.outputs, node?.params, nodeId])
 
   if (!node) return null
 

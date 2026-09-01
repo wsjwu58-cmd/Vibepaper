@@ -215,7 +215,7 @@ def extract_user_explicit_params(content: str) -> dict[str, Any]:
     if mm:
         hint = re.sub(r"\s+", "", mm.group(1)).lower()
         if "agnes" in hint and "image" in hint:
-            out["model"] = "agnes-image-2.1-flash"
+            out["model"] = "agnes-image-2.5-flash"
         elif "agnes" in hint and "video" in hint:
             out["model"] = "agnes-video-v2.0"
         elif "agnes" in hint:
@@ -225,13 +225,13 @@ def extract_user_explicit_params(content: str) -> dict[str, Any]:
         elif "1.5" in hint or "1-5" in hint or "1.0" in hint or "1-0" in hint:
             out["model"] = "agnes-video-v2.0"
         elif hint.startswith("doubao-seedance") or hint.startswith("doubao-seedream"):
-            out["model"] = "agnes-video-v2.0" if "seedance" in hint or "seedream" not in hint else "agnes-image-2.1-flash"
+            out["model"] = "agnes-video-v2.0" if "seedance" in hint or "seedream" not in hint else "agnes-image-2.5-flash"
             if "seedream" in hint:
-                out["model"] = "agnes-image-2.1-flash"
+                out["model"] = "agnes-image-2.5-flash"
         elif hint.startswith("deepseek") or "agnes-2.5" in hint or hint in {"agnes-flash", "agnes-text"}:
             out["model"] = "agnes-2.5-flash"
         elif "seedream5" in hint.replace(".", "").replace("-", "") or "seedream" in hint:
-            out["model"] = "agnes-image-2.1-flash"
+            out["model"] = "agnes-image-2.5-flash"
         elif "kling" in hint or "可灵" in hint:
             out["model"] = "agnes-video-v2.0"
 

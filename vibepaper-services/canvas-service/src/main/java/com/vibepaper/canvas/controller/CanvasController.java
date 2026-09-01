@@ -51,8 +51,10 @@ public class CanvasController {
     }
 
     @PostMapping("/{canvasId}/save")
-    public CanvasDtos.CanvasDetail save(@PathVariable Long canvasId, @RequestBody CanvasDtos.SaveCanvasRequest req) {
-        return canvasService.save(canvasId, req);
+    public CanvasDtos.CanvasDetail save(@PathVariable Long canvasId,
+                                        @RequestHeader("Idempotency-Key") String idempotencyKey,
+                                        @RequestBody CanvasDtos.SaveCanvasRequest req) {
+        return canvasService.save(canvasId, req, idempotencyKey);
     }
 
     @PostMapping("/{canvasId}/export")
@@ -71,28 +73,38 @@ public class CanvasController {
     }
 
     // ---- 节点 ----
+    @GetMapping("/{canvasId}/nodes/{nodeId}")
+    public CanvasDtos.NodePayload getNode(@PathVariable Long canvasId, @PathVariable Long nodeId) {
+        return graphService.getNode(canvasId, nodeId);
+    }
+
     @PostMapping("/{canvasId}/nodes")
     public CanvasDtos.NodePayload addNode(@PathVariable Long canvasId,
+                                          @RequestHeader("Idempotency-Key") String idempotencyKey,
                                           @Valid @RequestBody CanvasDtos.CreateNodeRequest req) {
-        return graphService.addNode(canvasId, req);
+        return graphService.addNode(canvasId, req, idempotencyKey);
     }
 
     @PutMapping("/{canvasId}/nodes/{nodeId}")
     public CanvasDtos.NodePayload updateNode(@PathVariable Long canvasId, @PathVariable Long nodeId,
+                                             @RequestHeader("Idempotency-Key") String idempotencyKey,
                                              @RequestBody CanvasDtos.UpdateNodeRequest req) {
-        return graphService.updateNode(canvasId, nodeId, req);
+        return graphService.updateNode(canvasId, nodeId, req, idempotencyKey);
     }
 
     @DeleteMapping("/{canvasId}/nodes/{nodeId}")
-    public Map<String, Object> deleteNode(@PathVariable Long canvasId, @PathVariable Long nodeId) {
-        return graphService.deleteNode(canvasId, nodeId);
+    public Map<String, Object> deleteNode(@PathVariable Long canvasId, @PathVariable Long nodeId,
+                                          @RequestHeader("Idempotency-Key") String idempotencyKey,
+                                          @RequestParam(required = false) Integer expectedVersion) {
+        return graphService.deleteNode(canvasId, nodeId, expectedVersion, idempotencyKey);
     }
 
     // ---- 连线 ----
     @PostMapping("/{canvasId}/edges")
     public CanvasDtos.EdgePayload addEdge(@PathVariable Long canvasId,
+                                          @RequestHeader("Idempotency-Key") String idempotencyKey,
                                           @Valid @RequestBody CanvasDtos.CreateEdgeRequest req) {
-        return graphService.addEdge(canvasId, req);
+        return graphService.addEdge(canvasId, req, idempotencyKey);
     }
 
     @DeleteMapping("/{canvasId}/edges/{edgeId}")

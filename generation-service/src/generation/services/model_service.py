@@ -5,6 +5,7 @@ import time
 
 from sqlalchemy.orm import Session
 
+from ..core.config import settings
 from ..models import ModelConfig, PricingRule
 
 _id_seq = itertools.count(1)
@@ -115,30 +116,34 @@ model_service = ModelService()
 
 def seed_models(db: Session):
     """种子模型目录：文本仅 Agnes 2.5 Flash；图像/视频默认 Agnes。"""
+    speech_configured = bool((settings.speech_app_id or "").strip() and (settings.speech_token or "").strip())
     # (name, type, display, desc, provider, price, defaults, enabled)
     seeds = [
         # 文本：仅 Agnes 2.5 Flash
         ("agnes-2.5-flash", "text", "Agnes 2.5 Flash", "Agnes 对话/Agent/画布文本（推荐）", "agnes-text", 8, {"prompt": ""}, True),
-        # 图片：Agnes Image 2.1 Flash
-        ("agnes-image-2.1-flash", "image", "Agnes Image 2.1 Flash", "Agnes 文生图/图生图/多图合成（推荐）", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K", "ratio": "16:9"}, True),
-        ("seedream-4", "image", "Agnes Image 2.1 Flash", "兼容别名 → Agnes Image", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K", "ratio": "16:9"}, False),
-        ("doubao-seedream-5-0-260128", "image", "Agnes Image 2.1 Flash", "兼容别名 → Agnes Image", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K"}, False),
+        # 图片：Agnes Image 2.5 Flash
+        ("agnes-image-2.5-flash", "image", "Agnes Image 2.5 Flash", "Agnes 文生图/图生图/多图合成（推荐）", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K", "ratio": "16:9"}, True),
+        ("agnes-image-2.1-flash", "image", "Agnes Image 2.1 Flash（兼容别名）", "兼容旧请求，实际路由到 Agnes Image 2.5 Flash", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K", "ratio": "16:9"}, False),
+        ("seedream-4", "image", "Agnes Image 2.5 Flash", "兼容别名 → Agnes Image", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K", "ratio": "16:9"}, False),
+        ("doubao-seedream-5-0-260128", "image", "Agnes Image 2.5 Flash", "兼容别名 → Agnes Image", "agnes-image", 8, {"resolution": "1920x1080", "size": "2K"}, False),
         ("doubao-seedream-4-0-250828", "image", "Seedream 4.0", "已停用（改用 Agnes）", "agnes-image", 12, {"resolution": "1024x1024", "size": "1K"}, False),
         ("doubao-seedream-4-5-251128", "image", "Seedream 4.5", "已停用（改用 Agnes）", "agnes-image", 12, {"resolution": "1024x1024", "size": "1K"}, False),
         ("flux-dev", "image", "FLUX.1 dev", "本地 Mock（已停用）", "mock-image", 20, {"resolution": "1024x1024"}, False),
         ("sd3-medium", "image", "Stable Diffusion 3", "本地 Mock（已停用）", "mock-image", 15, {"resolution": "1024x1024"}, False),
-        # 视频：Agnes Video V2.0
-        ("agnes-video-v2.0", "video", "Agnes Video V2.0", "Agnes 文生视频/图生视频/关键帧（推荐）", "agnes-video", 35, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, True),
-        ("seedance-1.0", "video", "Agnes Video V2.0", "兼容别名 → Agnes Video", "agnes-video", 35, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
-        ("wan-2.1", "video", "Agnes Video V2.0", "兼容别名 → Agnes Video", "agnes-video", 35, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
-        ("doubao-seedance-1-5-pro-251215", "video", "Agnes Video V2.0", "兼容别名 → Agnes Video", "agnes-video", 35, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
+        # 视频：Agnes Video 2.5 Flash（免费模型）
+        ("agnes-video-2.5-flash", "video", "Agnes Video 2.5 Flash", "Agnes 720P 文生视频/关键帧/参考视频（推荐）", "agnes-video", 35, {"size": "720P", "seconds": 5, "aspect_ratio": "16:9", "n": 1}, True),
+        ("agnes-video-v2.0", "video", "Agnes Video V2.0（兼容别名）", "兼容旧请求，实际路由到 Agnes Video 2.5 Flash", "agnes-video", 35, {"size": "720P", "seconds": 5, "aspect_ratio": "16:9", "n": 1}, False),
+        ("seedance-1.0", "video", "Agnes Video 2.5 Flash", "兼容别名 → Agnes Video 2.5 Flash", "agnes-video", 35, {"size": "720P", "seconds": 5, "aspect_ratio": "16:9", "n": 1}, False),
+        ("wan-2.1", "video", "Agnes Video 2.5 Flash", "兼容别名 → Agnes Video 2.5 Flash", "agnes-video", 35, {"size": "720P", "seconds": 5, "aspect_ratio": "16:9", "n": 1}, False),
+        ("doubao-seedance-1-5-pro-251215", "video", "Agnes Video 2.5 Flash", "兼容别名 → Agnes Video 2.5 Flash", "agnes-video", 35, {"size": "720P", "seconds": 5, "aspect_ratio": "16:9", "n": 1}, False),
         ("doubao-seedance-1-0-pro-250528", "video", "Seedance 1.0 Pro", "已停用（改用 Agnes）", "agnes-video", 30, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
         ("doubao-seedance-2-0-mini-260615", "video", "Seedance 2.0 Mini", "已停用（改用 Agnes）", "agnes-video", 40, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
         ("doubao-seedance-2-0-260128", "video", "Seedance 2.0", "已停用（改用 Agnes）", "agnes-video", 80, {"resolution": "1152x768", "duration": 5, "ratio": "16:9"}, False),
         ("kling-2.0", "video", "可灵 2.0", "本地 Mock（已停用）", "mock-video", 60, {"resolution": "1280x720"}, False),
         # 音频：豆包语音合成（需 VIBEPAPER_SPEECH_*）；旧 Mock 停用
-        ("doubao-tts", "audio", "豆包语音合成", "旁白/对白 TTS（火山语音·免费额度）", "doubao-tts", 8, {"voice": "zh_female_tianmeixiaoyuan_moon_bigtts", "speed": 1.0}, True),
-        ("doubao-tts-2", "audio", "豆包语音合成 2.0", "语音合成 2.0（火山语音）", "doubao-tts", 8, {"voice": "zh_female_tianmeixiaoyuan_moon_bigtts", "speed": 1.0}, True),
+        ("local-sapi-tts", "audio", "本地语音合成", "Windows SAPI 离线 TTS（开发环境）", "local-sapi-tts", 0, {"voice": "female", "language": "zh-CN", "speed": 1.0, "tone": "neutral", "outputFormat": "wav"}, settings.environment.lower() == "development"),
+        ("doubao-tts", "audio", "豆包语音合成", "旁白/对白 TTS（火山语音·免费额度）", "doubao-tts", 8, {"voice": "zh_female_tianmeixiaoyuan_moon_bigtts", "speed": 1.0}, speech_configured),
+        ("doubao-tts-2", "audio", "豆包语音合成 2.0", "语音合成 2.0（火山语音）", "doubao-tts", 8, {"voice": "zh_female_tianmeixiaoyuan_moon_bigtts", "speed": 1.0}, speech_configured),
         ("music-1.5", "audio", "Music 1.5", "本地 Mock（已停用）", "mock-audio", 10, {}, False),
         ("audio-1.0", "audio", "Audio 1.0", "本地 Mock（已停用）", "mock-audio", 8, {}, False),
         ("compose-1.0", "compose", "视频合成", "多段视频按顺序拼接成片（本地 FFmpeg）", "mock-compose", 15, {"operation": "compose"}, True),

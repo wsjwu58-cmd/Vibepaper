@@ -21,11 +21,12 @@ _MOCK_PROVIDERS = frozenset({
 
 
 def _preferred_name(modality: str) -> str | None:
+    speech_configured = bool((settings.speech_app_id or "").strip() and (settings.speech_token or "").strip())
     mapping = {
         "text": (settings.llm_model or "agnes-2.5-flash").strip() or "agnes-2.5-flash",
-        "image": (settings.agnes_image_model or "agnes-image-2.1-flash").strip(),
-        "video": (settings.agnes_video_model or "agnes-video-v2.0").strip(),
-        "audio": "doubao-tts",
+        "image": (settings.agnes_image_model or "agnes-image-2.5-flash").strip(),
+        "video": (settings.agnes_video_model or "agnes-video-2.5-flash").strip(),
+        "audio": "doubao-tts" if speech_configured else "local-sapi-tts" if settings.environment.lower() == "development" else "doubao-tts",
         "compose": "compose-1.0",
         "director": "director-1.0",
     }

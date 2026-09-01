@@ -13,6 +13,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pi-agent-service:
+    name: Pi Agent service (lint + typecheck + unit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: pi-main
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: pi-main/package-lock.json
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Build Pi core packages
+        run: |
+          npm run build --workspace=@earendil-works/pi-telemetry
+          npm run hydrate:model-data
+          npm run build:offline --workspace=@earendil-works/pi-ai
+          npm run build --workspace=@earendil-works/pi-agent-core
+      - name: Biome lint
+        run: npx biome check packages/vibepaper-agent-service/src packages/vibepaper-agent-service/test
+      - name: Typecheck
+        run: npx tsgo -p packages/vibepaper-agent-service/tsconfig.build.json --noEmit
+      - name: Unit and migration tests
+        run: npm exec -- vitest --run packages/vibepaper-agent-service/test
+
   # ──────────────────────────────────────────────
   # Java 微服务：Maven 编译 + verify（含 Flyway 迁移检查）
   # 对齐 AGENTS.md §9.3 门禁：规范检查 → 单元测试 → 迁移测试

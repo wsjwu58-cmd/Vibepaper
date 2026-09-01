@@ -18,7 +18,7 @@ VIDEO_PREF_RESOLUTION = "1280x720"
 VIDEO_PREF_DURATION = 5
 VIDEO_PREF_GENERATE_AUDIO = True
 
-IMAGE_PREF_MODEL = "agnes-image-2.1-flash"
+IMAGE_PREF_MODEL = "agnes-image-2.5-flash"
 IMAGE_PREF_RESOLUTION = "1920x1080"
 
 # —— 模型能力（参数合法性；不在目录里编造）——

@@ -1,6 +1,8 @@
 package com.vibepaper.canvas.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vibepaper.canvas.domain.EdgeRules;
 import com.vibepaper.canvas.dto.CanvasDtos;
 import com.vibepaper.canvas.entity.*;
@@ -28,11 +30,21 @@ public class GraphService {
     private final CanvasEdgeMapper edgeMapper;
     private final CanvasGroupMapper groupMapper;
     private final CanvasStackMapper stackMapper;
+    private final CanvasGraphCommandMapper graphCommandMapper;
     private final SnowflakeIdGenerator idGenerator;
+    private final ObjectMapper objectMapper;
+
+    public CanvasDtos.NodePayload getNode(Long canvasId, Long nodeId) {
+        canvasService.requireOwned(canvasId);
+        return canvasService.toNodePayload(requireNode(canvasId, nodeId));
+    }
 
     @Transactional
-    public CanvasDtos.NodePayload addNode(Long canvasId, CanvasDtos.CreateNodeRequest req) {
+    public CanvasDtos.NodePayload addNode(Long canvasId, CanvasDtos.CreateNodeRequest req, String idempotencyKey) {
         canvasService.requireOwned(canvasId);
+        CanvasDtos.NodePayload replay = replay(idempotencyKey, canvasId, "create_nodes", CanvasDtos.NodePayload.class);
+        if (replay != null) return replay;
+        canvasService.assertAndAdvanceVersion(canvasId, req.expectedVersion());
         if (!EdgeRules.isValidNodeType(req.type())) {
             throw ApiException.badRequest(ErrorCode.INVALID_INPUT, "非法节点类型: " + req.type());
         }
@@ -56,12 +68,17 @@ public class GraphService {
         node.setCreatedAt(OffsetDateTime.now());
         node.setUpdatedAt(OffsetDateTime.now());
         nodeMapper.insert(node);
-        return canvasService.toNodePayload(node);
+        CanvasDtos.NodePayload result = canvasService.toNodePayload(node);
+        remember(canvasId, idempotencyKey, "create_nodes", result);
+        return result;
     }
 
     @Transactional
-    public CanvasDtos.NodePayload updateNode(Long canvasId, Long nodeId, CanvasDtos.UpdateNodeRequest req) {
+    public CanvasDtos.NodePayload updateNode(Long canvasId, Long nodeId, CanvasDtos.UpdateNodeRequest req, String idempotencyKey) {
         canvasService.requireOwned(canvasId);
+        CanvasDtos.NodePayload replay = replay(idempotencyKey, canvasId, "update_node_config", CanvasDtos.NodePayload.class);
+        if (replay != null) return replay;
+        canvasService.assertAndAdvanceVersion(canvasId, req.expectedVersion());
         CanvasNode node = requireNode(canvasId, nodeId);
         if (req.x() != null) {
             node.setPositionX(req.x());
@@ -127,12 +144,17 @@ public class GraphService {
         if (contentChanged) {
             canvasService.markDownstreamStale(canvasId, nodeId);
         }
-        return canvasService.toNodePayload(node);
+        CanvasDtos.NodePayload result = canvasService.toNodePayload(node);
+        remember(canvasId, idempotencyKey, "update_node_config", result);
+        return result;
     }
 
     @Transactional
-    public Map<String, Object> deleteNode(Long canvasId, Long nodeId) {
+    public Map<String, Object> deleteNode(Long canvasId, Long nodeId, Integer expectedVersion, String idempotencyKey) {
         canvasService.requireOwned(canvasId);
+        Map<String, Object> replay = replayMap(idempotencyKey, canvasId, "delete_nodes");
+        if (replay != null) return replay;
+        canvasService.assertAndAdvanceVersion(canvasId, expectedVersion);
         CanvasNode node = requireNode(canvasId, nodeId);
         List<CanvasEdge> connected = edgeMapper.selectList(new LambdaQueryWrapper<CanvasEdge>()
                 .eq(CanvasEdge::getCanvasId, canvasId)
@@ -152,24 +174,30 @@ public class GraphService {
             edgeMapper.deleteById(edge.getId());
         }
         impact.put("deletedNodeId", nodeId);
+        remember(canvasId, idempotencyKey, "delete_nodes", impact);
         return impact;
     }
 
     @Transactional
-    public CanvasDtos.EdgePayload addEdge(Long canvasId, CanvasDtos.CreateEdgeRequest req) {
+    public CanvasDtos.EdgePayload addEdge(Long canvasId, CanvasDtos.CreateEdgeRequest req, String idempotencyKey) {
         canvasService.requireOwned(canvasId);
+        CanvasDtos.EdgePayload replay = replay(idempotencyKey, canvasId, "connect_nodes", CanvasDtos.EdgePayload.class);
+        if (replay != null) return replay;
         if (req.sourceNodeId().equals(req.targetNodeId())) {
             throw ApiException.badRequest(ErrorCode.EDGE_INVALID, "禁止自连接");
         }
-        CanvasNode source = requireNode(canvasId, req.sourceNodeId());
-        CanvasNode target = requireNode(canvasId, req.targetNodeId());
-        Long duplicate = edgeMapper.selectCount(new LambdaQueryWrapper<CanvasEdge>()
+        CanvasEdge existing = edgeMapper.selectOne(new LambdaQueryWrapper<CanvasEdge>()
                 .eq(CanvasEdge::getCanvasId, canvasId)
                 .eq(CanvasEdge::getSourceNodeId, req.sourceNodeId())
                 .eq(CanvasEdge::getTargetNodeId, req.targetNodeId()));
-        if (duplicate > 0) {
-            throw ApiException.badRequest(ErrorCode.EDGE_INVALID, "重复连线");
+        if (existing != null) {
+            CanvasDtos.EdgePayload result = canvasService.toEdgePayload(existing);
+            remember(canvasId, idempotencyKey, "connect_nodes", result);
+            return result;
         }
+        canvasService.assertAndAdvanceVersion(canvasId, req.expectedVersion());
+        CanvasNode source = requireNode(canvasId, req.sourceNodeId());
+        CanvasNode target = requireNode(canvasId, req.targetNodeId());
         boolean compatible = EdgeRules.isCompatible(source.getNodeType(), target.getNodeType());
         if (!compatible) {
             throw ApiException.badRequest(ErrorCode.EDGE_INVALID,
@@ -192,7 +220,9 @@ public class GraphService {
         edge.setCreatedAt(OffsetDateTime.now());
         edge.setUpdatedAt(OffsetDateTime.now());
         edgeMapper.insert(edge);
-        return canvasService.toEdgePayload(edge);
+        CanvasDtos.EdgePayload result = canvasService.toEdgePayload(edge);
+        remember(canvasId, idempotencyKey, "connect_nodes", result);
+        return result;
     }
 
     @Transactional
@@ -372,6 +402,53 @@ public class GraphService {
             case "director" -> "导演台节点";
             default -> "节点";
         };
+    }
+
+    private <T> T replay(String idempotencyKey, Long canvasId, String operation, Class<T> type) {
+        CanvasGraphCommand command = claim(canvasId, idempotencyKey, operation);
+        if (command.getResultSnapshot() == null || "{}".equals(command.getResultSnapshot())) return null;
+        try {
+            return objectMapper.readValue(command.getResultSnapshot(), type);
+        } catch (Exception e) {
+            throw new IllegalStateException("画布命令结果快照损坏", e);
+        }
+    }
+
+    private Map<String, Object> replayMap(String idempotencyKey, Long canvasId, String operation) {
+        CanvasGraphCommand command = claim(canvasId, idempotencyKey, operation);
+        if (command.getResultSnapshot() == null || "{}".equals(command.getResultSnapshot())) return null;
+        try {
+            return objectMapper.readValue(command.getResultSnapshot(), new TypeReference<>() {
+            });
+        } catch (Exception e) {
+            throw new IllegalStateException("画布命令结果快照损坏", e);
+        }
+    }
+
+    private CanvasGraphCommand claim(Long canvasId, String idempotencyKey, String operation) {
+        if (idempotencyKey == null || idempotencyKey.isBlank() || idempotencyKey.length() > 128) {
+            throw ApiException.badRequest(ErrorCode.INVALID_INPUT, "Idempotency-Key 必须为 1-128 个字符");
+        }
+        Map<String, Object> params = Map.of(
+                "id", idGenerator.nextId(),
+                "canvasId", canvasId,
+                "idempotencyKey", idempotencyKey,
+                "operation", operation);
+        return graphCommandMapper.claim(params);
+    }
+
+    private void remember(Long canvasId, String idempotencyKey, String operation, Object result) {
+        try {
+            CanvasGraphCommand command = graphCommandMapper.selectOne(new LambdaQueryWrapper<CanvasGraphCommand>()
+                    .eq(CanvasGraphCommand::getCanvasId, canvasId)
+                    .eq(CanvasGraphCommand::getIdempotencyKey, idempotencyKey));
+            command.setOperation(operation);
+            command.setResultCanvasVersion(canvasService.getById(canvasId).getVersion());
+            command.setResultSnapshot(objectMapper.writeValueAsString(result));
+            graphCommandMapper.updateById(command);
+        } catch (Exception e) {
+            throw new IllegalStateException("画布命令结果快照写入失败", e);
+        }
     }
 
     private String writeJson(Object obj) {

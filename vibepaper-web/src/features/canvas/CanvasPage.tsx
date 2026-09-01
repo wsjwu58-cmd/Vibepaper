@@ -58,6 +58,7 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   const setCanvas = useCanvasStore((s) => s.setCanvas)
   const setGroups = useCanvasStore((s) => s.setGroups)
   const setStacks = useCanvasStore((s) => s.setStacks)
+  const dirty = useCanvasStore((s) => s.dirty)
   const setDirty = useCanvasStore((s) => s.setDirty)
   const setSaving = useCanvasStore((s) => s.setSaving)
   const selectNode = useCanvasStore((s) => s.selectNode)
@@ -80,6 +81,9 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   } | null>(null)
   const { fitView, screenToFlowPosition } = useReactFlow()
   const saveTimer = useRef<number | null>(null)
+  const externalSyncPending = useRef(false)
+  const externalSyncTimer = useRef<number | null>(null)
+  const hydratingRef = useRef(true)
   const [savedVersion, setSavedVersion] = useState<number | null>(null)
   const skipNextSave = useRef(true)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -103,23 +107,34 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   })
 
   useEffect(() => {
-    let t: number | null = null
     const onAgentExecuted = () => {
-      if (t != null) window.clearTimeout(t)
-      t = window.setTimeout(() => {
-        t = null
-        void refetch()
-      }, 1600)
+      // Agent writes are authoritative remote mutations. Do not let a pending
+      // local full-save race them with an old canvas version; hydrate the
+      // resulting graph immediately instead of waiting for a page refresh.
+      externalSyncPending.current = true
+      if (saveTimer.current) {
+        window.clearTimeout(saveTimer.current)
+        saveTimer.current = null
+      }
+      skipNextSave.current = true
+      if (externalSyncTimer.current != null) window.clearTimeout(externalSyncTimer.current)
+      externalSyncTimer.current = window.setTimeout(() => {
+        externalSyncTimer.current = null
+        void refetch().finally(() => {
+          externalSyncPending.current = false
+        })
+      }, 80)
     }
     window.addEventListener('vp-agent-executed', onAgentExecuted)
     return () => {
       window.removeEventListener('vp-agent-executed', onAgentExecuted)
-      if (t != null) window.clearTimeout(t)
+      if (externalSyncTimer.current != null) window.clearTimeout(externalSyncTimer.current)
     }
   }, [refetch])
 
   useEffect(() => {
     if (!detail) return
+    hydratingRef.current = true
     skipNextSave.current = true
     setCanvas(detail)
     const flow = buildFlow(detail, selectNode)
@@ -129,8 +144,15 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
     setGroups(detail.groups)
     setStacks(detail.stacks)
     setSavedVersion(detail.canvas.version)
+    // Hydrating the authoritative server snapshot is not a local edit. Clear
+    // any stale dirty flag so a refresh (or an Agent write) cannot trigger a
+    // full-save/version bump loop immediately after hydration.
+    setDirty(false)
+    window.setTimeout(() => {
+      hydratingRef.current = false
+    }, 0)
     // 仅在画布 detail 变化时整表 hydrate；models 单独注入，避免覆盖已编辑的 prompt
-  }, [detail, setCanvas, setNodes, setEdges, setGroups, setStacks, selectNode])
+  }, [detail, setCanvas, setNodes, setEdges, setGroups, setStacks, setDirty, selectNode])
 
   useEffect(() => {
     if (!models) return
@@ -141,7 +163,7 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   }, [models, setNodes])
 
   const save = useCallback(async () => {
-    if (!canvas) return
+    if (!canvas || externalSyncPending.current) return
     setSaving(true)
     try {
       const res = await api<CanvasDetail>(`/canvases/${sid(canvas.canvas.id)}/save`, {
@@ -176,7 +198,11 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
 
   // 防抖自动保存（300-500ms 增量落盘 + 乐观锁）；跳过初次 hydrate
   useEffect(() => {
-    if (!canvas || savedVersion === null) return
+    // A successful full save replaces `canvas` with the server response. Do
+    // not treat that authoritative response as a new edit: without this
+    // dirty guard, changing the canvas version retriggers the effect forever
+    // and can advance the optimistic-lock version hundreds of times.
+    if (!canvas || savedVersion === null || !dirty) return
     if (skipNextSave.current) {
       skipNextSave.current = false
       return
@@ -186,7 +212,7 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
       saveTimer.current = null
       void saveRef.current()
     }, saveDebounce)
-  }, [nodes, edges, groups, stacks, canvas, savedVersion])
+  }, [nodes, edges, groups, stacks, canvas, savedVersion, dirty])
 
   // 离开画布 / 关闭页面前冲掉未落盘的防抖保存（含提示词）
   useEffect(() => {
@@ -208,7 +234,10 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
       setNodes(applyNodeChanges(changes, nodes) as FlowNode[])
       const sel = changes.filter((c) => c.type === 'select').pop() as { selected?: boolean; id?: string } | undefined
       if (sel?.id) selectNode(sel.selected ? sid(sel.id) : null)
-      setDirty(true)
+      // React Flow emits internal replace/measurement/selection changes while
+      // hydrating/rendering the graph. Dirty state is set by explicit edit
+      // handlers (and drag-stop below), never by this reconciliation callback;
+      // otherwise an Agent confirmation can become stale from view updates.
     },
     [nodes, setNodes, selectNode, setDirty],
   )
@@ -216,7 +245,8 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
       setEdges(applyEdgeChanges(changes, edges))
-      setDirty(true)
+      // Edge reconciliation is likewise view state; explicit connect/delete
+      // handlers below mark real edge edits dirty.
     },
     [edges, setEdges, setDirty],
   )
@@ -758,6 +788,7 @@ function CanvasPageInner({ canvasId }: { canvasId: string }) {
         }))}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onNodeDragStop={() => setDirty(true)}
         onConnect={onConnect}
         onNodesDelete={onNodesDelete}
         onEdgesDelete={onEdgesDelete}

@@ -110,6 +110,9 @@ export async function api<T = unknown>(
     "Content-Type": "application/json",
     ...((options.headers as Record<string, string>) ?? {}),
   };
+  if (options.method && !['GET', 'HEAD', 'OPTIONS'].includes(options.method.toUpperCase()) && !headers['Idempotency-Key']) {
+    headers['Idempotency-Key'] = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+  }
 
   const res = await authedFetch(path, { ...options, headers });
 
@@ -179,7 +182,11 @@ export async function uploadAsset(
   if (type) fd.append("type", type);
   if (canvasId != null) fd.append("canvasId", String(canvasId));
   if (nodeId != null) fd.append("nodeId", String(nodeId));
-  const res = await authedFetch("/assets", { method: "POST", body: fd });
+  const res = await authedFetch("/assets", {
+    method: "POST",
+    body: fd,
+    idempotencyKey: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+  });
   if (!res.ok) throw new ApiError(res.status, "UPLOAD_FAILED", "上传失败");
   return parseJsonPreserveIds(await res.text());
 }

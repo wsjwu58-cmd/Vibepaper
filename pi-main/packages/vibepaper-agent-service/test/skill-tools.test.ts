@@ -4,12 +4,31 @@ import { createLoadSkillTool } from "../src/tools/skill-tools.ts";
 
 describe("Skill progressive disclosure", () => {
 	it("extracts all workspace skills with the correct builtin/dynamic split", () => {
-		expect(SYSTEM_SKILLS).toHaveLength(16);
+		expect(SYSTEM_SKILLS).toHaveLength(23);
 		expect(SYSTEM_SKILLS.filter((skill) => skill.kind === "builtin-core").map((skill) => skill.key)).toEqual([
 			"canvas-cookbook",
 			"director-stage",
 		]);
-		expect(SYSTEM_SKILLS.filter((skill) => skill.kind === "dynamic")).toHaveLength(14);
+		expect(SYSTEM_SKILLS.filter((skill) => skill.kind === "dynamic")).toHaveLength(21);
+		expect(SYSTEM_SKILLS.map((skill) => skill.key)).toEqual(
+			expect.arrayContaining([
+				"product-visual",
+				"product-spray-ad",
+				"anti-gravity-product",
+				"ecommerce-operation",
+				"trend-pv",
+				"real-scene-paper",
+				"interface-design",
+			]),
+		);
+	});
+
+	it("makes the vertical-episode skill require a connected canvas production workflow", () => {
+		const workflow = SYSTEM_SKILLS.find((skill) => skill.key === "vertical-episode");
+
+		expect(workflow?.instructions).toContain("画布生产合同");
+		expect(workflow?.instructions).toContain("故事圣经 → 角色参考包 → 剧本与分镜 → 关键帧 → 视频 → 成片合成");
+		expect(workflow?.instructions).toContain("上游节点连线");
 	});
 
 	it("loads the body once and returns a stable session URI", async () => {

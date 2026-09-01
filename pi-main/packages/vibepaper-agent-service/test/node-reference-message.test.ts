@@ -3,10 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../src/api/app.ts";
 import type { StoredAgentMessage } from "../src/application/agent-runtime.ts";
-import {
-	NodeReferenceContextError,
-	type NodeReferenceSnapshot,
-} from "../src/application/node-reference-context.ts";
+import { NodeReferenceContextError, type NodeReferenceSnapshot } from "../src/application/node-reference-context.ts";
 import { loadConfig } from "../src/config.ts";
 import type { SqlExecutor } from "../src/infrastructure/database.ts";
 import { ToolGateway } from "../src/infrastructure/tool-gateway.ts";
@@ -86,20 +83,21 @@ afterEach(async () => {
 
 describe("node reference message contract", () => {
 	it("reads canonical nodes through the user-authorized canvas API", async () => {
-		const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
-			new Response(
-				JSON.stringify({
-					nodes: [
-						{
-							id: "12",
-							type: "image",
-							status: "ready",
-							params: { title: "橘猫角色卡", lastOutputUrl: "/outputs/file/cat.png" },
-						},
-					],
-				}),
-				{ status: 200, headers: { "Content-Type": "application/json" } },
-			),
+		const fetchMock = vi.fn(
+			async (_input: string | URL | Request, _init?: RequestInit) =>
+				new Response(
+					JSON.stringify({
+						nodes: [
+							{
+								id: "12",
+								type: "image",
+								status: "ready",
+								params: { title: "橘猫角色卡", lastOutputUrl: "/outputs/file/cat.png" },
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
 		);
 		vi.stubGlobal("fetch", fetchMock);
 		const gateway = new ToolGateway(loadConfig({ VIBEPAPER_CANVAS_BASE_URL: "http://canvas-service" }));
@@ -165,7 +163,7 @@ describe("node reference message contract", () => {
 		const response = await app.inject({
 			method: "POST",
 			url: "/api/v1/agent/sessions/201/messages",
-			headers: { "x-user-id": "101" },
+			headers: { "x-user-id": "101", "idempotency-key": "node-reference-1" },
 			payload: {
 				content: "根据图片进行创作",
 				canvasId: "301",
@@ -175,6 +173,13 @@ describe("node reference message contract", () => {
 		});
 
 		expect(response.statusCode).toBe(200);
+		expect(response.headers["x-request-id"]).toBeTruthy();
+		expect(response.body.startsWith(": connected\n\n")).toBe(true);
+		expect(response.body).toContain("event: assistant_delta");
+		expect(response.body).toContain("event: run_completed");
+		expect(response.body.indexOf("event: assistant_delta")).toBeLessThan(
+			response.body.indexOf("event: run_completed"),
+		);
 		expect(observed.content).toBe("根据图片进行创作");
 		expect(observed.references).toEqual(references);
 		expect(observed.history).toEqual([]);
@@ -192,7 +197,7 @@ describe("node reference message contract", () => {
 		const followUp = await app.inject({
 			method: "POST",
 			url: "/api/v1/agent/sessions/201/messages",
-			headers: { "x-user-id": "101" },
+			headers: { "x-user-id": "101", "idempotency-key": "node-reference-2" },
 			payload: { content: "继续", canvasId: "301", selectedNodeIds: [] },
 		});
 		expect(followUp.statusCode).toBe(200);
