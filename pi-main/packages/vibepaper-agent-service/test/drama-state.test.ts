@@ -161,4 +161,17 @@ describe("vertical short-drama state", () => {
 		expect(agent.toolExecution).toBe("sequential");
 		expect(agent.state.tools.map((tool) => tool.name)).toEqual(["prepare_keyframe_node", "prepare_video_node"]);
 	});
+
+	it("does not expose the legacy draft-only drama tools to the runtime profile", () => {
+		const agent = createDramaAgent(createReadyStore(), {
+			profile: "vertical-short-drama",
+			streamFn: () => {
+				throw new Error("No model stream should run in this construction test");
+			},
+		});
+
+		expect(agent.state.tools.map((tool) => tool.name)).not.toEqual(
+			expect.arrayContaining(["prepare_keyframe_node", "prepare_video_node"]),
+		);
+	});
 });

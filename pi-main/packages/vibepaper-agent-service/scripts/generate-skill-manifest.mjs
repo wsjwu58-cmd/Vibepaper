@@ -18,6 +18,13 @@ const keyByName = new Map([
 	["电影感单图", "cinematic-still"],
 	["电影感三联图", "cinematic-triptych"],
 	["生命感人像", "vital-portrait"],
+	["产品视觉", "product-visual"],
+	["产品喷绘广告", "product-spray-ad"],
+	["反重力产品广告", "anti-gravity-product"],
+	["电商经营", "ecommerce-operation"],
+	["潮流视觉 PV", "trend-pv"],
+	["实景纸刊", "real-scene-paper"],
+	["界面设计", "interface-design"],
 	["Canvas Cookbook", "canvas-cookbook"],
 	["DirectorStage 3D 导演台", "director-stage"],
 ]);
@@ -47,7 +54,7 @@ const definitions = blocks.map((match) => {
 	};
 });
 
-if (definitions.length !== 16) throw new Error(`期望 16 个 Skill，实际提取 ${definitions.length} 个`);
+if (definitions.length !== 23) throw new Error(`期望 23 个 Skill，实际提取 ${definitions.length} 个`);
 
 writeFileSync(
 	output,

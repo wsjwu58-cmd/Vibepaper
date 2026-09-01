@@ -14,7 +14,11 @@ export class NacosRegistrar {
 	}
 
 	async start(): Promise<void> {
-		if (!this.config.nacosUsername || !this.config.nacosPassword) return;
+		if (!this.config.nacosUsername || !this.config.nacosPassword) {
+			if (this.config.environment === "production" || this.config.environment === "staging")
+				throw new Error("NACOS_CREDENTIALS_MISSING");
+			return;
+		}
 		await this.register();
 		this.heartbeat = setInterval(() => {
 			void this.beat();
@@ -41,7 +45,7 @@ export class NacosRegistrar {
 
 	private async register(): Promise<void> {
 		const token = await this.login();
-		if (!token) return;
+		if (!token) throw new Error("NACOS_LOGIN_FAILED");
 		const query = new URLSearchParams({
 			serviceName: this.config.appName,
 			ip: this.ip,
@@ -55,10 +59,11 @@ export class NacosRegistrar {
 			metadata: JSON.stringify({ app: this.config.appName, runtime: "pi-agent" }),
 			accessToken: token,
 		});
-		await fetch(`http://${this.config.nacosAddr}/nacos/v1/ns/instance?${query}`, {
+		const response = await fetch(`http://${this.config.nacosAddr}/nacos/v1/ns/instance?${query}`, {
 			method: "POST",
 			signal: AbortSignal.timeout(5000),
-		}).catch(() => undefined);
+		});
+		if (!response.ok) throw new Error(`NACOS_REGISTER_FAILED:${response.status}`);
 	}
 
 	private async beat(): Promise<void> {

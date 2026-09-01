@@ -29,9 +29,25 @@ import { ModelPicker } from '@/components/ui/ModelPicker'
 import { useCanvasStore } from './canvasStore'
 import { toastError, toastSuccess } from '@/components/ui/Toast'
 import { cn } from '@/lib/cn'
+import {
+  resolveAgentCanvasVersion,
+  resolveBoundConfirmationCanvasVersion,
+  resolveConfirmationCanvasVersion,
+} from './confirmationVersion'
 import type { AgentChatMsg, AgentConfirmation, AgentSuggestion, ExecutionStep } from './agentTypes'
 import { AgentNextActions, AgentTaskBadge, AgentTurnTimeline } from './AgentExecutionRecord'
-import { applyAgentEvent, isChatVisibleMessage, shouldRefreshCanvas } from './agentEventHandlers'
+import {
+  applyAgentEvent,
+  isChatVisibleMessage,
+  shouldRefreshCanvas,
+  shouldRefreshCanvasEvent,
+} from './agentEventHandlers'
+import {
+  isAgentEventEnvelope,
+  reduceAgentEvent,
+  type AgentEventEnvelope,
+  type AgentEventState,
+} from './agentEventEnvelope'
 import { AgentComposerBar } from './AgentComposerBar'
 import { AgentNodeReferenceCards } from './AgentNodeReferenceCards'
 import {
@@ -43,6 +59,7 @@ import {
   type ComposerRef,
 } from './agentNodeReferences'
 import { DramaAssetsTab } from './DramaAssetsTab'
+import { getEventStreamReconnectDelay, scrollChatToBottom, shouldReloadSessionAfterStream } from './agentEventStream'
 
 const AGENT_PANEL_DEFAULT_WIDTH = 380
 const AGENT_PANEL_MIN_WIDTH = 300
@@ -98,6 +115,7 @@ export function AgentPanel() {
   const [tab, setTab] = useState<'chat' | 'pref' | 'skills' | 'usage' | 'history' | 'drama'>('chat')
   const [composerRefs, setComposerRefs] = useState<ComposerRef[]>([])
   const previousSelectedNodeIdsRef = useRef<Set<string>>(new Set())
+  const chatScrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const sseAbortRef = useRef<AbortController | null>(null)
   const sendAbortRef = useRef<AbortController | null>(null)
@@ -109,6 +127,45 @@ export function AgentPanel() {
   const [confirmingActionId, setConfirmingActionId] = useState<string | null>(null)
   const busyRef = useRef(false)
   const canvasId = canvas?.canvas.id
+  const previousCanvasIdRef = useRef<string | number | undefined>(undefined)
+  const lastEventSeqRef = useRef(0)
+  const agentEventStateRef = useRef<AgentEventState>({
+    messages: [],
+    seenEventIds: new Set(),
+    runStatus: 'running',
+  })
+
+  const consumeAgentEnvelope = (event: AgentEventEnvelope): void => {
+    setMessages((previous) => {
+      const next = reduceAgentEvent({ ...agentEventStateRef.current, messages: previous }, event)
+      agentEventStateRef.current = next
+      return next.messages
+    })
+    if (event.type === 'run_failed') {
+      toastError(String(event.data.message ?? event.data.errorCode ?? 'Agent 运行失败'))
+    } else if (event.type === 'run_aborted') {
+      setTypingTurnId(null)
+    }
+  }
+
+  useEffect(() => {
+    const previousCanvasId = previousCanvasIdRef.current
+    if (previousCanvasId !== undefined && String(previousCanvasId) !== String(canvasId)) {
+      sseAbortRef.current?.abort()
+      sendAbortRef.current?.abort()
+      sseAbortRef.current = null
+      sendAbortRef.current = null
+      setSessionId(null)
+      setSessionTitle('新对话')
+      setMessages([])
+      setSuggestions([])
+      setComposerRefs([])
+      setTypingTurnId(null)
+      agentEventStateRef.current = { messages: [], seenEventIds: new Set(), runStatus: 'running' }
+      lastEventSeqRef.current = 0
+    }
+    previousCanvasIdRef.current = canvasId
+  }, [canvasId])
 
   useEffect(() => {
     busyRef.current = busy
@@ -164,6 +221,13 @@ export function AgentPanel() {
   }
 
   const handleBackgroundEvent = (ev: Record<string, unknown>) => {
+    if (isAgentEventEnvelope(ev)) {
+      if (shouldRefreshCanvasEvent(ev)) {
+        window.dispatchEvent(new Event('vp-agent-executed'))
+      }
+      consumeAgentEnvelope(ev)
+      return
+    }
     if (shouldRefreshCanvas(ev)) {
       window.dispatchEvent(new Event('vp-agent-executed'))
     }
@@ -201,11 +265,12 @@ export function AgentPanel() {
     const res = await api<{ items: AgentChatMsg[] }>(`/agent/sessions/${id}/messages`)
     setSessionId(id)
     setSessionTitle(title || `对话 #${id}`)
-    setMessages(
-      res.items
-        .map((m) => ({ ...m, type: m.type || 'text', meta: (m.meta as AgentChatMsg['meta']) ?? {} }))
-        .filter(isChatVisibleMessage),
-    )
+    const loadedMessages = res.items
+      .map((m) => ({ ...m, type: m.type || 'text', meta: (m.meta as AgentChatMsg['meta']) ?? {} }))
+      .filter(isChatVisibleMessage)
+    agentEventStateRef.current = { messages: loadedMessages, seenEventIds: new Set(), runStatus: 'running' }
+    lastEventSeqRef.current = 0
+    setMessages(loadedMessages)
     setSuggestions([])
     setComposerRefs([])
   }
@@ -258,42 +323,66 @@ export function AgentPanel() {
     if (!open || !sessionId) return
     const ac = new AbortController()
     sseAbortRef.current = ac
+    let active = true
     void (async () => {
-      try {
-        const res = await authedFetch(`/agent/sessions/${sessionId}/events`, {
-          signal: ac.signal,
-        })
-        if (!res.ok || !res.body) return
-        const reader = res.body.getReader()
-        const decoder = new TextDecoder()
-        let buf = ''
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buf += decoder.decode(value, { stream: true })
-          const parts = buf.split('\n\n')
-          buf = parts.pop() ?? ''
-          for (const part of parts) {
-            const dataLine = part.split('\n').find((l) => l.startsWith('data: '))
-            if (!dataLine) continue
-            const ev = parseJsonPreserveIds(dataLine.slice(6)) as Record<string, unknown>
-            if (ev.type === 'task_status' || ev.type === 'assistant_message' || ev.type === 'canvas_changed') {
-              handleBackgroundEvent(ev)
+      let retryMs = 250
+      while (active && !ac.signal.aborted) {
+        let terminal = false
+        try {
+          const cursor = lastEventSeqRef.current
+          const query = cursor > 0 ? `?afterSeq=${cursor}` : ''
+          const res = await authedFetch(`/agent/sessions/${sessionId}/events${query}`, { signal: ac.signal })
+          if (!res.ok || !res.body) throw new Error(`events:${res.status}`)
+          const reader = res.body.getReader()
+          const decoder = new TextDecoder()
+          let buf = ''
+          while (active && !ac.signal.aborted) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += decoder.decode(value, { stream: true })
+            const parts = buf.split('\n\n')
+            buf = parts.pop() ?? ''
+            for (const part of parts) {
+              const dataLine = part.split('\n').find((l) => l.startsWith('data: '))
+              if (!dataLine) continue
+              const ev = parseJsonPreserveIds(dataLine.slice(6)) as Record<string, unknown>
+              if (ev.type === 'idle') {
+                terminal = true
+                continue
+              }
+              if (isAgentEventEnvelope(ev)) {
+                lastEventSeqRef.current = Math.max(lastEventSeqRef.current, ev.eventSeq)
+                if (ev.type === 'run_completed' || ev.type === 'run_failed' || ev.type === 'run_aborted') terminal = true
+              }
+              if (
+                isAgentEventEnvelope(ev) ||
+                ev.type === 'task_status' ||
+                ev.type === 'assistant_message' ||
+                ev.type === 'canvas_changed'
+              ) {
+                handleBackgroundEvent(ev)
+              }
             }
           }
+          if (terminal) break
+          await new Promise<void>((resolve) => window.setTimeout(resolve, getEventStreamReconnectDelay(retryMs)))
+          retryMs = getEventStreamReconnectDelay(retryMs * 2)
+        } catch {
+          if (!active || ac.signal.aborted) break
+          await new Promise<void>((resolve) => window.setTimeout(resolve, retryMs))
+          retryMs = Math.min(5000, retryMs * 2)
         }
-      } catch {
-        /* closed or network */
       }
     })()
     return () => {
+      active = false
       ac.abort()
       sseAbortRef.current = null
     }
   }, [open, sessionId])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (chatScrollRef.current) scrollChatToBottom(chatScrollRef.current)
   }, [messages, busy])
 
   // busy 结束后若逐字已追上仍卡住标记，做兜底清理
@@ -360,6 +449,9 @@ export function AgentPanel() {
   const stop = () => {
     sendAbortRef.current?.abort()
     sendAbortRef.current = null
+    if (sessionId) {
+      void api(`/agent/sessions/${sessionId}/cancel`, { method: 'POST' }).catch(() => undefined)
+    }
     setBusy(false)
   }
 
@@ -375,7 +467,15 @@ export function AgentPanel() {
     if (add.length) setComposerRefs((prev) => upsertRefs(prev, add))
   }
 
-  const processStreamEvent = (ev: Record<string, unknown>) => {
+    const processStreamEvent = (ev: Record<string, unknown>) => {
+    if (isAgentEventEnvelope(ev)) {
+      if (shouldRefreshCanvasEvent(ev)) {
+        window.dispatchEvent(new Event('vp-agent-executed'))
+      }
+      if (ev.type === 'assistant_delta') setTypingTurnId(turnIdRef.current)
+      consumeAgentEnvelope(ev)
+      return
+    }
     if (shouldRefreshCanvas(ev)) {
       window.dispatchEvent(new Event('vp-agent-executed'))
     }
@@ -434,16 +534,34 @@ export function AgentPanel() {
     setConfirmingActionId(confirmation.actionId)
     patchConfirmation(confirmation.actionId, 'submitting')
     try {
-      const result = await api<{ ok: boolean; cancelled?: boolean; events?: Record<string, unknown>[] }>(
+      const canvasVersion = confirmation.canvasVersion != null
+        ? resolveBoundConfirmationCanvasVersion(confirmation.canvasVersion)
+        : canvas?.canvas.id != null
+          ? resolveConfirmationCanvasVersion(
+              await api<{ canvas?: { version?: unknown }; version?: unknown }>(`/canvases/${canvas.canvas.id}`),
+              canvas?.canvas.version,
+            )
+          : resolveConfirmationCanvasVersion({}, canvas?.canvas.version)
+      const result = await api<{
+        ok: boolean
+        cancelled?: boolean
+        taskId?: string
+        status?: string
+        events?: Record<string, unknown>[]
+      }>(
         `/agent/sessions/${sessionId}/confirmations/${confirmation.actionId}`,
         {
           method: 'POST',
-          body: JSON.stringify({ approvalToken: confirmation.approvalToken, accept }),
+          body: JSON.stringify({
+            approvalToken: confirmation.approvalToken,
+            accept,
+            canvasVersion,
+          }),
         },
       )
       patchConfirmation(confirmation.actionId, accept ? 'accepted' : 'rejected')
       for (const event of result.events ?? []) processStreamEvent(event)
-      if (accept) toastSuccess('已确认，Agent 正在继续执行')
+      if (accept) toastSuccess(result.taskId ? '已确认，生成任务已提交' : '已确认，Agent 正在继续执行')
     } catch (error) {
       patchConfirmation(confirmation.actionId, 'pending')
       toastError((error as Error).message || '确认操作失败')
@@ -464,12 +582,33 @@ export function AgentPanel() {
       toastError('请先在确认卡片中确认或取消当前高风险操作')
       return
     }
+    setBusy(true)
+    let sid: string | number
+    try {
+      sid = await ensureSession()
+    } catch (e) {
+      toastError((e as Error).message)
+      setBusy(false)
+      return
+    }
+    let requestCanvasVersion = canvas?.canvas.version
+    if (canvas?.canvas.id != null) {
+      try {
+        const latestCanvas = await api<{ canvas?: { version?: unknown }; version?: unknown }>(
+          `/canvases/${canvas.canvas.id}`,
+        )
+        requestCanvasVersion = resolveAgentCanvasVersion(latestCanvas, requestCanvasVersion)
+      } catch (e) {
+        toastError((e as Error).message || '无法读取当前画布版本，请刷新后重试')
+        setBusy(false)
+        return
+      }
+    }
     const sentNodeRefs = composerRefs.filter((ref) => ref.kind === 'node')
     const sentNodeIds = [...new Set(sentNodeRefs.map((ref) => ref.id))]
     const nodeReferences = nodeReferencesForComposer(sentNodeRefs, useCanvasStore.getState().nodes)
-    const isFirstUserTurn = !messages.some((m) => m.role === 'user')
+    const isFirstUserTurn = !agentEventStateRef.current.messages.some((m) => m.role === 'user')
     setInput('')
-    setBusy(true)
     setSuggestions([])
     // 对话历史命名：首条用户语句
     if (
@@ -482,35 +621,51 @@ export function AgentPanel() {
     turnIdRef.current = turnId
     // 本轮一开始就标记为「需要逐字」，避免等事件时已同批贴全文
     setTypingTurnId(turnId)
-    setMessages((m) => [
-      ...m,
-      {
-        id: Date.now(),
-        role: 'user',
-        type: 'text',
-        content,
-        meta: { selectedNodeIds: sentNodeIds, nodeReferences },
-      },
-      {
-        id: turnId,
-        role: 'assistant',
-        type: 'text',
-        content: '',
-        meta: { executionSteps: [] as ExecutionStep[] },
-      },
-    ])
+    setMessages((m) => {
+      const next = [
+        ...m,
+        {
+          id: Date.now(),
+          role: 'user',
+          type: 'text',
+          content,
+          meta: { selectedNodeIds: sentNodeIds, nodeReferences },
+        },
+        {
+          id: turnId,
+          role: 'assistant',
+          type: 'text',
+          content: '',
+          meta: { executionSteps: [] as ExecutionStep[] },
+        },
+      ]
+      agentEventStateRef.current = { messages: next, seenEventIds: new Set(), runStatus: 'running' }
+      return next
+    })
     const ac = new AbortController()
     sendAbortRef.current = ac
+    let confirmationRehydrate: Promise<void> | null = null
+    const rehydrateAfterConfirmation = () => {
+      if (!confirmationRehydrate) {
+        confirmationRehydrate = loadSessionQuiet(sid).catch((error) => {
+          toastError((error as Error).message || '确认状态刷新失败')
+        })
+      }
+    }
     try {
-      const sid = await ensureSession()
       if (ac.signal.aborted) return
       const res = await authedFetch(`/agent/sessions/${sid}/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': globalThis.crypto.randomUUID(),
+        },
         body: JSON.stringify({
           content,
           selectedNodeIds: sentNodeIds,
           canvasId: canvas?.canvas.id != null ? String(canvas.canvas.id) : undefined,
+          canvasVersion: requestCanvasVersion,
+          modelId: agentModel,
         }),
         signal: ac.signal,
       })
@@ -532,14 +687,29 @@ export function AgentPanel() {
         for (const part of parts) {
           const dataLine = part.split('\n').find((l) => l.startsWith('data: '))
           if (!dataLine) continue
-          const ev = parseJsonPreserveIds(dataLine.slice(6)) as Record<string, unknown>
-          if (ev.type === 'done') continue
-          processStreamEvent(ev)
+          // A reconnecting proxy can leave one partial/invalid SSE frame in
+          // the stream. Ignore that frame and continue consuming the next
+          // authoritative event rather than aborting the whole Agent turn and
+          // surfacing a raw JSON parser error to the creator.
+          let ev: Record<string, unknown>
+          try {
+            ev = parseJsonPreserveIds(dataLine.slice(6)) as Record<string, unknown>
+          } catch {
+            continue
+          }
+           if (ev.type === 'done') continue
+           processStreamEvent(ev)
+           if (shouldReloadSessionAfterStream([ev])) rehydrateAfterConfirmation()
           // 让出主线程，避免一整包事件被 React 批成一次渲染
           await new Promise<void>((r) => setTimeout(r, 0))
         }
       }
       if (ac.signal.aborted) return
+      // The terminal SSE envelope can be coalesced or omitted by a proxy. Rehydrate
+      // the authoritative session after every normal stream completion so pending
+      // confirmations and terminal messages cannot be lost in local reducer state.
+      if (confirmationRehydrate) await confirmationRehydrate
+      else await loadSessionQuiet(sid)
       window.dispatchEvent(new Event('vp-agent-executed'))
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') return
@@ -631,7 +801,7 @@ export function AgentPanel() {
 
       {tab === 'chat' && (
         <div className="flex min-h-0 flex-1 flex-col bg-[var(--canvas-surface)]">
-          <div className="relative min-h-0 flex-1 overflow-y-auto bg-transparent px-3.5 pb-8 pt-3.5">
+          <div ref={chatScrollRef} className="relative min-h-0 flex-1 overflow-y-auto bg-transparent px-3.5 pb-8 pt-3.5">
             {composerRefs.some((ref) => ref.kind === 'node') && (
               <p className="mb-3 rounded-full bg-[#f2f2f2] px-3 py-1.5 text-[11px] font-semibold text-[#555]">
                 已加入 {composerRefs.filter((ref) => ref.kind === 'node').length} 个参考节点，将随下一条消息发送
@@ -1000,7 +1170,7 @@ function PreferencesTab() {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [pref, setPref] = useState({
     text: resolvePreferredTextModel(preferences?.defaultTextModel),
-    image: preferences?.defaultImageModel || 'agnes-image-2.1-flash',
+    image: preferences?.defaultImageModel || 'agnes-image-2.5-flash',
     video: preferences?.defaultVideoModel || 'agnes-video-v2.0',
     resolution: preferences?.defaultResolution || '1024x1024',
   })
@@ -1015,7 +1185,7 @@ function PreferencesTab() {
   useEffect(() => {
     setPref({
       text: resolvePreferredTextModel(preferences?.defaultTextModel),
-      image: preferences?.defaultImageModel || 'agnes-image-2.1-flash',
+    image: preferences?.defaultImageModel || 'agnes-image-2.5-flash',
       video: preferences?.defaultVideoModel || 'agnes-video-v2.0',
       resolution: preferences?.defaultResolution || '1024x1024',
     })
@@ -1149,6 +1319,31 @@ function UsageTab({ sessionId }: { sessionId: string | number | null }) {
   )
 }
 
+type HistorySession = { sessionId: string | number; title: string; updatedAt?: string }
+
+export function AgentHistorySessionItem({
+  session,
+  active,
+  onOpen,
+}: {
+  session: HistorySession
+  active: boolean
+  onOpen: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={`w-full rounded-[16px] border px-2.5 py-2 text-left text-[12px] ${
+        active ? 'border-[#111] bg-[#f7f7f7]' : 'border-black/6 hover:bg-[#f7f7f7]'
+      }`}
+    >
+      <p className="font-bold text-[#333]">{session.title}</p>
+      <p className="text-[#999]">{active ? '当前会话' : '历史会话'}</p>
+    </button>
+  )
+}
+
 function HistoryTab({
   sessionId,
   canvasId,
@@ -1160,7 +1355,7 @@ function HistoryTab({
   onOpenSession: (id: string | number, title?: string) => void
   onImported: (id: string | number) => void
 }) {
-  const [sessions, setSessions] = useState<Array<{ sessionId: string | number; title: string; updatedAt?: string }>>([])
+  const [sessions, setSessions] = useState<HistorySession[]>([])
   const [fragments, setFragments] = useState<Array<{ id: number; title: string }>>([])
   const reload = () => {
     const q = canvasId != null ? `?canvasId=${encodeURIComponent(String(canvasId))}` : ''
@@ -1197,17 +1392,12 @@ function HistoryTab({
       </button>
       <p className="text-[12px] font-bold text-[#555]">对话历史</p>
       {sessions.map((s) => (
-        <button
+        <AgentHistorySessionItem
           key={s.sessionId}
-          type="button"
-          onClick={() => onOpenSession(s.sessionId, s.title)}
-          className={`w-full rounded-[16px] border px-2.5 py-2 text-left text-[12px] ${
-            String(s.sessionId) === String(sessionId) ? 'border-[#111] bg-[#f7f7f7]' : 'border-black/6 hover:bg-[#f7f7f7]'
-          }`}
-        >
-          <p className="font-bold text-[#333]">{s.title}</p>
-          <p className="text-[#999]">#{s.sessionId}</p>
-        </button>
+          session={s}
+          active={String(s.sessionId) === String(sessionId)}
+          onOpen={() => onOpenSession(s.sessionId, s.title)}
+        />
       ))}
       <p className="text-[12px] font-bold text-[#555]">可复用片段</p>
       {fragments.map((f) => (

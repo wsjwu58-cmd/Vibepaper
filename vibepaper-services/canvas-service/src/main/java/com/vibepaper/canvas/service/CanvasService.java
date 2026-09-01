@@ -1,6 +1,7 @@
 package com.vibepaper.canvas.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.vibepaper.canvas.domain.EdgeRules;
 import com.vibepaper.canvas.dto.CanvasDtos;
@@ -41,6 +42,7 @@ public class CanvasService {
     private final CanvasStackMapper stackMapper;
     private final CanvasRevisionMapper revisionMapper;
     private final CanvasShareMapper shareMapper;
+    private final CanvasGraphCommandMapper graphCommandMapper;
     private final SnowflakeIdGenerator idGenerator;
     private final ObjectMapper objectMapper;
 
@@ -109,9 +111,22 @@ public class CanvasService {
     }
 
     @Transactional
-    public CanvasDtos.CanvasDetail save(Long canvasId, CanvasDtos.SaveCanvasRequest req) {
-        Canvas canvas = requireOwned(canvasId);
+    public CanvasDtos.CanvasDetail save(Long canvasId, CanvasDtos.SaveCanvasRequest req, String idempotencyKey) {
+        // A full save replaces every graph row. Lock the canvas before reading
+        // its version so Agent graph commands cannot interleave an insert into
+        // the delete/reinsert window.
+        Canvas canvas = requireOwnedForUpdate(canvasId);
+        CanvasGraphCommand replay = claimGraphCommand(canvasId, idempotencyKey, "save_canvas");
+        if (replay.getResultSnapshot() != null && !"{}".equals(replay.getResultSnapshot())) {
+            try {
+                return objectMapper.readValue(replay.getResultSnapshot(), CanvasDtos.CanvasDetail.class);
+            } catch (Exception e) {
+                throw new IllegalStateException("画布保存命令结果快照损坏", e);
+            }
+        }
         if (!canvas.getVersion().equals(req.version())) {
+            log.warn("canvas save version conflict canvasId={} currentVersion={} requestVersion={}",
+                    canvasId, canvas.getVersion(), req.version());
             throw ApiException.conflict(ErrorCode.VERSION_CONFLICT, "画布已在其他会话更新，请刷新");
         }
 
@@ -120,7 +135,13 @@ public class CanvasService {
         Map<Long, CanvasNode> previousById = previousNodes.stream()
                 .collect(Collectors.toMap(CanvasNode::getId, n -> n, (a, b) -> a));
 
-        // 全量替换节点/连线/编组/堆叠
+        // 全量替换节点/连线/编组/堆叠。图实体启用了逻辑删除，但保存
+        // 会复用客户端传来的稳定 ID；必须物理删除旧行，否则同 ID 重插
+        // 会触发主键冲突并被网关映射成 CANVAS_UNAVAILABLE。
+        nodeMapper.hardDeleteByCanvasId(canvasId);
+        edgeMapper.hardDeleteByCanvasId(canvasId);
+        groupMapper.hardDeleteByCanvasId(canvasId);
+        stackMapper.hardDeleteByCanvasId(canvasId);
         nodeMapper.delete(new LambdaQueryWrapper<CanvasNode>().eq(CanvasNode::getCanvasId, canvasId));
         edgeMapper.delete(new LambdaQueryWrapper<CanvasEdge>().eq(CanvasEdge::getCanvasId, canvasId));
         groupMapper.delete(new LambdaQueryWrapper<CanvasGroup>().eq(CanvasGroup::getCanvasId, canvasId));
@@ -216,13 +237,22 @@ public class CanvasService {
             }
         }
 
-        // 乐观锁：version +1
-        canvas.setVersion(canvas.getVersion() + 1);
-        canvas.setUpdatedAt(OffsetDateTime.now());
-        int updated = canvasMapper.updateById(canvas);
+        // 乐观锁：使用显式 version 条件更新。Canvas 标注了 @Version，
+        // 因而不能先把实体 version 手动加一再调用 updateById（插件会
+        // 把已加一的值当作旧版本，导致永远更新 0 行）。
+        int currentVersion = canvas.getVersion();
+        int nextVersion = currentVersion + 1;
+        OffsetDateTime now = OffsetDateTime.now();
+        int updated = canvasMapper.update(null, new LambdaUpdateWrapper<Canvas>()
+                .eq(Canvas::getId, canvasId)
+                .eq(Canvas::getVersion, currentVersion)
+                .set(Canvas::getVersion, nextVersion)
+                .set(Canvas::getUpdatedAt, now));
         if (updated == 0) {
             throw ApiException.conflict(ErrorCode.VERSION_CONFLICT, "画布已在其他会话更新，请刷新");
         }
+        canvas.setVersion(nextVersion);
+        canvas.setUpdatedAt(now);
 
         CanvasRevision revision = new CanvasRevision();
         revision.setId(idGenerator.nextId());
@@ -232,7 +262,15 @@ public class CanvasService {
         revision.setCreatedAt(OffsetDateTime.now());
         revisionMapper.insert(revision);
 
-        return buildDetail(canvas);
+        CanvasDtos.CanvasDetail result = buildDetail(canvas);
+        try {
+            replay.setResultCanvasVersion(canvas.getVersion());
+            replay.setResultSnapshot(objectMapper.writeValueAsString(result));
+            graphCommandMapper.updateById(replay);
+        } catch (Exception e) {
+            throw new IllegalStateException("画布保存命令结果快照写入失败", e);
+        }
+        return result;
     }
 
     public Map<String, Object> export(Long canvasId) {
@@ -409,8 +447,46 @@ public class CanvasService {
         return canvas;
     }
 
+    private Canvas requireOwnedForUpdate(Long canvasId) {
+        Canvas canvas = canvasMapper.selectByIdForUpdate(canvasId);
+        Long userId = RequestContext.userIdLong();
+        if (canvas == null) {
+            throw ApiException.notFound("画布不存在");
+        }
+        if (userId == null || !canvas.getOwnerId().equals(userId)) {
+            throw ApiException.forbidden("无权访问该画布");
+        }
+        return canvas;
+    }
+
+    /** 节点/连线增量命令的原子乐观锁；expectedVersion 为空仅兼容非 Agent 内部调用。 */
+    @Transactional
+    public void assertAndAdvanceVersion(Long canvasId, Integer expectedVersion) {
+        Canvas canvas = requireOwned(canvasId);
+        if (expectedVersion != null && !expectedVersion.equals(canvas.getVersion())) {
+            throw ApiException.conflict(ErrorCode.VERSION_CONFLICT, "画布已在其他会话更新，请刷新");
+        }
+        int updated = canvasMapper.update(null, new LambdaUpdateWrapper<Canvas>()
+                .eq(Canvas::getId, canvasId)
+                .eq(Canvas::getVersion, canvas.getVersion())
+                .setSql("version = version + 1")
+                .setSql("updated_at = now()"));
+        if (updated == 0) throw ApiException.conflict(ErrorCode.VERSION_CONFLICT, "画布已在其他会话更新，请刷新");
+    }
+
     public Canvas getById(Long canvasId) {
         return canvasMapper.selectById(canvasId);
+    }
+
+    private CanvasGraphCommand claimGraphCommand(Long canvasId, String idempotencyKey, String operation) {
+        if (idempotencyKey == null || idempotencyKey.isBlank() || idempotencyKey.length() > 128) {
+            throw ApiException.badRequest(ErrorCode.INVALID_INPUT, "Idempotency-Key 必须为 1-128 个字符");
+        }
+        return graphCommandMapper.claim(Map.of(
+                "id", idGenerator.nextId(),
+                "canvasId", canvasId,
+                "idempotencyKey", idempotencyKey,
+                "operation", operation));
     }
 
     public CanvasDtos.CanvasDetail buildDetail(Canvas canvas) {

@@ -52,7 +52,7 @@ def test_reinforce_video_prompt_with_first_frame():
 
 def test_reinforce_image_prompt_with_refs():
     out = _reinforce_prompt_with_reference(
-        {"prompt": "cinematic", "referenceImages": ["http://x/a.jpg"], "model": "agnes-image-2.1-flash"},
+        {"prompt": "cinematic", "referenceImages": ["http://x/a.jpg"], "model": "agnes-image-2.5-flash"},
         "image",
     )
     assert "cinematic" in out["prompt"]

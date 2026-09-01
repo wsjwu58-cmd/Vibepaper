@@ -190,7 +190,7 @@ export function SkillsPanel({
       return
     }
     try {
-      await api(`/skills/${active.id}/attach?sessionId=${sessionId}`, { method: 'POST' })
+      await api(`/agent/sessions/${sessionId}/skills/${active.id}:attach`, { method: 'POST' })
       toastSuccess(`已应用 Skill：${active.name}`)
       onApplied?.(active.name)
       onBackToChat()

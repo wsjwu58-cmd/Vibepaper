@@ -36,6 +36,7 @@ export class DramaDomainError extends Error {
 
 export interface DramaSeries {
 	id: string;
+	ownerId?: string;
 	canvasId: string;
 	activeCanonRevision: number;
 	format: DramaFormatSpec;
@@ -107,8 +108,8 @@ export interface VideoNodeDraft {
 }
 
 export interface DramaStateStore {
-	prepareKeyframeNode(shotId: string): KeyframeNodeDraft | Promise<KeyframeNodeDraft>;
-	prepareVideoNode(shotId: string): VideoNodeDraft | Promise<VideoNodeDraft>;
+	prepareKeyframeNode(shotId: string, ownerId?: string): KeyframeNodeDraft | Promise<KeyframeNodeDraft>;
+	prepareVideoNode(shotId: string, ownerId?: string): VideoNodeDraft | Promise<VideoNodeDraft>;
 }
 
 function requireText(value: string, field: string): string {
@@ -146,18 +147,19 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 	private readonly keyframesById = new Map<string, KeyframeRender>();
 	private readonly lineagesById = new Map<string, RenderLineage>();
 
-	createSeries(series: DramaSeries): void {
+	createSeries(series: DramaSeries, ownerId?: string): void {
 		if (this.seriesById.has(series.id)) {
 			throw new DramaDomainError("CONFLICT", "短剧系列已存在");
 		}
 		if (series.format.aspectRatio !== "9:16") {
 			throw new DramaDomainError("INVALID_FORMAT", "竖屏短剧必须使用 9:16");
 		}
-		this.seriesById.set(series.id, series);
+		this.seriesById.set(series.id, ownerId ? { ...series, ownerId } : series);
 	}
 
-	createCharacter(character: CharacterProfile): void {
-		if (!this.seriesById.has(character.seriesId)) {
+	createCharacter(character: CharacterProfile, ownerId?: string): void {
+		const series = this.seriesById.get(character.seriesId);
+		if (!series || (ownerId && series.ownerId !== ownerId)) {
 			throw new DramaDomainError("NOT_FOUND", "短剧系列不存在");
 		}
 		if (this.charactersById.has(character.id)) {
@@ -169,9 +171,10 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		this.charactersById.set(character.id, character);
 	}
 
-	addReferencePack(pack: CharacterReferencePack): void {
+	addReferencePack(pack: CharacterReferencePack, ownerId?: string): void {
 		const character = this.charactersById.get(pack.characterId);
-		if (!character) {
+		const series = character ? this.seriesById.get(character.seriesId) : undefined;
+		if (!character || (ownerId && series?.ownerId !== ownerId)) {
 			throw new DramaDomainError("NOT_FOUND", "角色不存在");
 		}
 		if (pack.lookRevision !== character.activeLookRevision) {
@@ -187,9 +190,9 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		this.referencePacksByCharacterId.set(pack.characterId, [...existing, pack]);
 	}
 
-	createShot(shot: ShotSpec): void {
+	createShot(shot: ShotSpec, ownerId?: string): void {
 		const series = this.seriesById.get(shot.seriesId);
-		if (!series) {
+		if (!series || (ownerId && series.ownerId !== ownerId)) {
 			throw new DramaDomainError("NOT_FOUND", "短剧系列不存在");
 		}
 		if (this.shotsById.has(shot.id)) {
@@ -213,8 +216,8 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		this.shotsById.set(shot.id, shot);
 	}
 
-	prepareKeyframeNode(shotId: string): KeyframeNodeDraft {
-		const shot = this.requireShot(shotId);
+	prepareKeyframeNode(shotId: string, ownerId?: string): KeyframeNodeDraft {
+		const shot = this.requireShot(shotId, ownerId);
 		const packs = shot.characterBindings.map((binding) => this.resolveSingleApprovedReferencePack(binding));
 		return {
 			nodeType: "image",
@@ -230,10 +233,10 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		};
 	}
 
-	recordKeyframe(render: KeyframeRender): void {
-		const shot = this.requireShot(render.shotId);
+	recordKeyframe(render: KeyframeRender, ownerId?: string): void {
+		const shot = this.requireShot(render.shotId, ownerId);
 		if (render.status === "accepted") {
-			const expectedPackIds = this.prepareKeyframeNode(shot.id).referencePackIds;
+			const expectedPackIds = this.prepareKeyframeNode(shot.id, ownerId).referencePackIds;
 			if (
 				render.referencePackIds.length !== expectedPackIds.length ||
 				render.referencePackIds.some((packId) => !expectedPackIds.includes(packId))
@@ -244,8 +247,8 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		this.keyframesById.set(render.id, render);
 	}
 
-	prepareVideoNode(shotId: string): VideoNodeDraft {
-		const shot = this.requireShot(shotId);
+	prepareVideoNode(shotId: string, ownerId?: string): VideoNodeDraft {
+		const shot = this.requireShot(shotId, ownerId);
 		const keyframe = [...this.keyframesById.values()].find(
 			(candidate) => candidate.shotId === shot.id && candidate.status === "accepted",
 		);
@@ -268,18 +271,24 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		};
 	}
 
-	recordLineage(lineage: RenderLineage): void {
-		this.requireShot(lineage.shotId);
+	recordLineage(lineage: RenderLineage, ownerId?: string): void {
+		this.requireShot(lineage.shotId, ownerId);
 		if (!this.keyframesById.has(lineage.keyframeRenderId)) {
 			throw new DramaDomainError("NOT_FOUND", "关键帧不存在");
 		}
 		this.lineagesById.set(lineage.id, lineage);
 	}
 
-	markLineagesStaleForCharacter(characterId: string): readonly string[] {
+	markLineagesStaleForCharacter(characterId: string, ownerId?: string): readonly string[] {
 		const staleIds: string[] = [];
 		for (const lineage of this.lineagesById.values()) {
-			const shot = this.requireShot(lineage.shotId);
+			let shot: ShotSpec;
+			try {
+				shot = this.requireShot(lineage.shotId, ownerId);
+			} catch (error) {
+				if (ownerId && error instanceof DramaDomainError && error.code === "NOT_FOUND") continue;
+				throw error;
+			}
 			if (!shot.characterBindings.some((binding) => binding.characterId === characterId)) continue;
 			if (lineage.status !== "stale") {
 				this.lineagesById.set(lineage.id, { ...lineage, status: "stale" });
@@ -289,9 +298,10 @@ export class InMemoryDramaStateStore implements DramaStateStore {
 		return staleIds;
 	}
 
-	private requireShot(shotId: string): ShotSpec {
+	private requireShot(shotId: string, ownerId?: string): ShotSpec {
 		const shot = this.shotsById.get(shotId);
-		if (!shot) {
+		const series = shot ? this.seriesById.get(shot.seriesId) : undefined;
+		if (!shot || (ownerId && series?.ownerId !== ownerId)) {
 			throw new DramaDomainError("NOT_FOUND", "镜头不存在");
 		}
 		return shot;

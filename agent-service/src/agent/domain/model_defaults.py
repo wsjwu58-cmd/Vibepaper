@@ -16,7 +16,7 @@ TEXT_MODEL_ALIASES = {
 
 _DEFAULTS = {
     "text": lambda: (settings.llm_model or "agnes-2.5-flash").strip() or "agnes-2.5-flash",
-    "image": lambda: "agnes-image-2.1-flash",
+    "image": lambda: "agnes-image-2.5-flash",
     "video": lambda: DEFAULT_VIDEO_MODEL,
     "audio": lambda: "doubao-tts",
     "compose": lambda: "compose-1.0",

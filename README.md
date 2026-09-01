@@ -17,6 +17,8 @@
 | 无限画布 | 平移缩放、节点/连线 CRUD、乐观锁自动保存、导入导出 |
 | 多模态生成 | 文本 / 图片 / 视频 / 音频节点，任务状态机与消耗预览 |
 | Agent 编排 | 基于 Pi Agent Core 的 SSE 流式对话、工具白名单、高风险操作确认令牌 |
+| Agent 控制面 | 会话 / Run 生命周期、事件流恢复、取消、任务终态回调、权限与审计 |
+| 短剧工作流 | 故事圣经、单集、分镜、关键帧、视频、音频 / 字幕与合成的依赖编排 |
 | 点数计费 | 冻结 → 结算 / 解冻，流水只追加，超时自动解冻 |
 | 素材库 | 上传、拖入画布、引用检查 |
 | 管理空间 | 画布管理、任务历史、订阅/点数、个人中心 |
@@ -122,6 +124,13 @@ Skill 仅向会话注入索引；正文通过 `load_skill` 按需加载。内置
 .\deploy\stop-all.ps1
 ```
 
+启动后可运行全栈健康检查；脚本会检查前端、Java 服务、生成服务、Agent、PostgreSQL、Redis、Nacos 和 RocketMQ 的连通性：
+
+```powershell
+.\deploy\verify-all.ps1
+.\deploy\verify-all.ps1 -Json
+```
+
 ### 前端
 
 ```powershell
@@ -140,6 +149,10 @@ pnpm dev   # http://localhost:5173
 
 **画布并发**：`canvas.version` 乐观锁；V1 不支持多人实时同编。
 
+**Agent 全链路**：Agent 通过受控工具读写画布和短剧领域事实，事件使用序号与 SSE cursor 支持恢复；生成提交、确认、取消、终态回写和点数对账均保留可审计链路。涉及高风险写入时，服务端拒绝绕过确认令牌的请求。
+
+**验证状态**：单元测试、契约测试、前端构建和离线评测已纳入本轮回归；真实 PostgreSQL / RocketMQ / Billing / Generation 集成、SSE 断线重连、进程重启恢复、Nacos 故障注入及灰度发布仍是生产发布前门槛。验证设计与结果见下方文档索引。
+
 详情见 `docs/VibePaper产品需求文档新版.md` 与 `docs/技术概要设计方案.md`。
 
 ---
@@ -155,6 +168,13 @@ pnpm dev   # http://localhost:5173
 | [执行计划](./docs/plans/execution-plan.md) | 分阶段排期 |
 | [Pi 全量迁移设计](./docs/specs/pi-agent-full-replacement-design.md) | Node.js + Pi Agent Core 的迁移基线 |
 | [短剧 Agent 方向](./docs/specs/pi-vertical-short-drama-agent-direction.md) | 短剧状态层、镜头流水线、审校与调度 |
+| [全链路验证计划](./docs/plans/2026-08-29-pi-agent-full-chain-validation-plan.md) | Agent A-D 全链路验收、证据和门禁 |
+| [实现差异审计](./docs/audits/pi-agent-full-implementation-gap-2026-08-29.md) | Agent 实现与契约的差异记录 |
+| [修复追踪器](./docs/audits/pi-agent-remediation-tracker.md) | 审计项、测试证据与验证状态 |
+| [评测协议](./docs/evals/pi-agent-evaluation-protocol.md) | 离线 / 线上评测字段与硬失败规则 |
+| [运行手册](./docs/operations/pi-agent-runbook.md) | 运行排障、链路追踪与回滚门槛 |
+
+评测运行输出默认写入 `output/evals/`，其中可能包含截图和媒体探针结果；这些运行产物不作为源码提交，提交前应只保留可复现的用例、脚本和报告。
 
 ---
 

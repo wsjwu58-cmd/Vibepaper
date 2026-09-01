@@ -2,9 +2,6 @@
 	"extends": "../../tsconfig.base.json",
 	"compilerOptions": {
 		"outDir": "./dist",
-		"paths": {
-			"@earendil-works/pi-agent-core": ["../agent/dist/index.d.ts"]
-		},
 		"rootDir": "./src"
 	},
 	"include": ["src/**/*.ts"],

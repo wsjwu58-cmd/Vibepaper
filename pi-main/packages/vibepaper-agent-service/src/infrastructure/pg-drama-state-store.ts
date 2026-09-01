@@ -13,7 +13,13 @@ import type {
 import { DramaDomainError } from "../domain/drama-state.ts";
 import type { SqlExecutor } from "./database.ts";
 
-type SeriesRow = { id: string; canvas_id: string; active_canon_revision: number; format: unknown };
+type SeriesRow = {
+	id: string;
+	canvas_id: string;
+	owner_id: string | null;
+	active_canon_revision: number;
+	format: unknown;
+};
 type CharacterRow = {
 	id: string;
 	series_id: string;
@@ -105,14 +111,20 @@ export class PgDramaStateStore implements DramaStateStore {
 		this.database = database;
 	}
 
-	async createSeries(series: DramaSeries): Promise<void> {
+	async createSeries(series: DramaSeries, ownerId?: string): Promise<void> {
 		if (series.format.aspectRatio !== "9:16") {
 			throw new DramaDomainError("INVALID_FORMAT", "竖屏短剧必须使用 9:16");
 		}
 		try {
 			await this.database.query(
-				"INSERT INTO drama_series (id, canvas_id, active_canon_revision, format) VALUES ($1, $2, $3, $4::jsonb)",
-				[series.id, series.canvasId, series.activeCanonRevision, JSON.stringify(series.format)],
+				"INSERT INTO drama_series (id, canvas_id, owner_id, active_canon_revision, format) VALUES ($1, $2, $3, $4, $5::jsonb)",
+				[
+					series.id,
+					series.canvasId,
+					ownerId ?? series.ownerId ?? null,
+					series.activeCanonRevision,
+					JSON.stringify(series.format),
+				],
 			);
 		} catch (error) {
 			if (isUniqueViolation(error)) throw new DramaDomainError("CONFLICT", "短剧系列已存在");
@@ -120,9 +132,9 @@ export class PgDramaStateStore implements DramaStateStore {
 		}
 	}
 
-	async createCharacter(character: CharacterProfile): Promise<void> {
+	async createCharacter(character: CharacterProfile, ownerId?: string): Promise<void> {
 		validateCharacter(character);
-		await this.requireSeries(character.seriesId);
+		await this.requireSeries(character.seriesId, ownerId);
 		try {
 			await this.database.query(
 				`INSERT INTO drama_characters
@@ -143,8 +155,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		}
 	}
 
-	async addReferencePack(pack: CharacterReferencePack): Promise<void> {
-		const character = await this.requireCharacter(pack.characterId);
+	async addReferencePack(pack: CharacterReferencePack, ownerId?: string): Promise<void> {
+		const character = await this.requireCharacter(pack.characterId, ownerId);
 		if (pack.lookRevision !== character.activeLookRevision) {
 			throw new DramaDomainError("VERSION_CONFLICT", "角色参考包不是当前 Look revision");
 		}
@@ -171,8 +183,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		}
 	}
 
-	async createShot(shot: ShotSpec): Promise<void> {
-		const series = await this.requireSeries(shot.seriesId);
+	async createShot(shot: ShotSpec, ownerId?: string): Promise<void> {
+		const series = await this.requireSeries(shot.seriesId, ownerId);
 		if (
 			shot.durationSeconds < series.format.minShotDurationSeconds ||
 			shot.durationSeconds > series.format.maxShotDurationSeconds
@@ -180,7 +192,7 @@ export class PgDramaStateStore implements DramaStateStore {
 			throw new DramaDomainError("INVALID_SHOT_DURATION", "竖屏短剧单镜时长必须在 2-5 秒之间");
 		}
 		for (const binding of shot.characterBindings) {
-			const character = await this.requireCharacter(binding.characterId);
+			const character = await this.requireCharacter(binding.characterId, ownerId);
 			if (character.seriesId !== shot.seriesId || character.activeLookRevision !== binding.lookRevision) {
 				throw new DramaDomainError("INVALID_CHARACTER_BINDING", "镜头未绑定系列当前角色 Look revision");
 			}
@@ -206,8 +218,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		}
 	}
 
-	async prepareKeyframeNode(shotId: string): Promise<KeyframeNodeDraft> {
-		const shot = await this.requireShot(shotId);
+	async prepareKeyframeNode(shotId: string, ownerId?: string): Promise<KeyframeNodeDraft> {
+		const shot = await this.requireShot(shotId, ownerId);
 		const packs = await Promise.all(
 			shot.characterBindings.map(async (binding) => await this.resolveReferencePack(binding)),
 		);
@@ -225,8 +237,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		};
 	}
 
-	async recordKeyframe(render: KeyframeRender): Promise<void> {
-		const expected = await this.prepareKeyframeNode(render.shotId);
+	async recordKeyframe(render: KeyframeRender, ownerId?: string): Promise<void> {
+		const expected = await this.prepareKeyframeNode(render.shotId, ownerId);
 		if (render.status === "accepted" && !sameIds(render.referencePackIds, expected.referencePackIds)) {
 			throw new DramaDomainError("MISSING_CHARACTER_REFERENCE", "关键帧未绑定当前角色参考包");
 		}
@@ -236,8 +248,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		);
 	}
 
-	async prepareVideoNode(shotId: string): Promise<VideoNodeDraft> {
-		const expected = await this.prepareKeyframeNode(shotId);
+	async prepareVideoNode(shotId: string, ownerId?: string): Promise<VideoNodeDraft> {
+		const expected = await this.prepareKeyframeNode(shotId, ownerId);
 		const result = await this.database.query<KeyframeRow>(
 			"SELECT id, shot_id, status, reference_pack_ids FROM drama_keyframes WHERE shot_id = $1 AND status = 'accepted' ORDER BY created_at DESC LIMIT 1",
 			[shotId],
@@ -256,8 +268,8 @@ export class PgDramaStateStore implements DramaStateStore {
 		};
 	}
 
-	async recordLineage(lineage: RenderLineage): Promise<void> {
-		await this.requireShot(lineage.shotId);
+	async recordLineage(lineage: RenderLineage, ownerId?: string): Promise<void> {
+		await this.requireShot(lineage.shotId, ownerId);
 		const keyframe = await this.database.query<KeyframeRow>(
 			"SELECT id, shot_id, status, reference_pack_ids FROM drama_keyframes WHERE id = $1",
 			[lineage.keyframeRenderId],
@@ -269,11 +281,13 @@ export class PgDramaStateStore implements DramaStateStore {
 		);
 	}
 
-	async markLineagesStaleForCharacter(characterId: string): Promise<readonly string[]> {
+	async markLineagesStaleForCharacter(characterId: string, ownerId?: string): Promise<readonly string[]> {
 		const result = await this.database.query<LineageRow & { character_bindings: unknown }>(
 			`SELECT lineage.id, lineage.shot_id, lineage.keyframe_render_id, lineage.status, shot.character_bindings
-			 FROM drama_render_lineages lineage JOIN drama_shots shot ON shot.id = lineage.shot_id
-			 WHERE lineage.status <> 'stale'`,
+				 FROM drama_render_lineages lineage JOIN drama_shots shot ON shot.id = lineage.shot_id
+				 JOIN drama_series series ON series.id = shot.series_id
+				 WHERE lineage.status <> 'stale' AND ($1::bigint IS NULL OR series.owner_id = $1::bigint)`,
+			[ownerId ?? null],
 		);
 		const ids = result.rows
 			.filter((lineage) =>
@@ -289,10 +303,10 @@ export class PgDramaStateStore implements DramaStateStore {
 		return ids;
 	}
 
-	private async requireSeries(id: string): Promise<DramaSeries> {
+	private async requireSeries(id: string, ownerId?: string): Promise<DramaSeries> {
 		const result = await this.database.query<SeriesRow>(
-			"SELECT id, canvas_id, active_canon_revision, format FROM drama_series WHERE id = $1",
-			[id],
+			"SELECT id, canvas_id, owner_id, active_canon_revision, format FROM drama_series WHERE id = $1 AND ($2::bigint IS NULL OR owner_id = $2::bigint)",
+			[id, ownerId ?? null],
 		);
 		const row = result.rows[0];
 		if (!row || typeof row.format !== "object" || row.format === null || Array.isArray(row.format)) {
@@ -313,16 +327,17 @@ export class PgDramaStateStore implements DramaStateStore {
 		}
 		return {
 			id: row.id,
+			ownerId: row.owner_id ?? undefined,
 			canvasId: row.canvas_id,
 			activeCanonRevision: row.active_canon_revision,
 			format: format as unknown as DramaSeries["format"],
 		};
 	}
 
-	private async requireCharacter(id: string): Promise<CharacterProfile> {
+	private async requireCharacter(id: string, ownerId?: string): Promise<CharacterProfile> {
 		const result = await this.database.query<CharacterRow>(
-			"SELECT id, series_id, name, identity_anchors, active_look_revision, voice_id FROM drama_characters WHERE id = $1",
-			[id],
+			"SELECT character.id, character.series_id, character.name, character.identity_anchors, character.active_look_revision, character.voice_id FROM drama_characters character JOIN drama_series series ON series.id = character.series_id WHERE character.id = $1 AND ($2::bigint IS NULL OR series.owner_id = $2::bigint)",
+			[id, ownerId ?? null],
 		);
 		const row = result.rows[0];
 		if (!row) throw new DramaDomainError("NOT_FOUND", "角色不存在");
@@ -336,10 +351,10 @@ export class PgDramaStateStore implements DramaStateStore {
 		};
 	}
 
-	private async requireShot(id: string): Promise<ShotSpec> {
+	private async requireShot(id: string, ownerId?: string): Promise<ShotSpec> {
 		const result = await this.database.query<ShotRow>(
-			"SELECT id, series_id, episode_no, shot_no, duration_seconds, character_bindings, prompt_revision FROM drama_shots WHERE id = $1",
-			[id],
+			"SELECT shot.id, shot.series_id, shot.episode_no, shot.shot_no, shot.duration_seconds, shot.character_bindings, shot.prompt_revision FROM drama_shots shot JOIN drama_series series ON series.id = shot.series_id WHERE shot.id = $1 AND ($2::bigint IS NULL OR series.owner_id = $2::bigint)",
+			[id, ownerId ?? null],
 		);
 		const row = result.rows[0];
 		if (!row) throw new DramaDomainError("NOT_FOUND", "镜头不存在");

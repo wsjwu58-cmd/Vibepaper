@@ -52,3 +52,22 @@ def test_agnes_text_provider_not_image():
     assert get_provider("agnes-2.5-flash", "text").name == "openai-text"
     assert get_provider("agnes-text", "agnes-2.5-flash").name == "openai-text"
     assert get_provider("agnes-image", "image").name == "agnes-image"
+
+
+def test_video_resolution_prefers_agnes_video_flash(monkeypatch):
+    from generation.providers.providers import resolve_video_model
+    from generation.services import model_resolve
+
+    monkeypatch.setattr(model_resolve.settings, "agnes_video_model", "agnes-video-2.5-flash")
+    assert model_resolve._preferred_name("video") == "agnes-video-2.5-flash"
+    assert resolve_video_model("agnes-video-v2.0") == "agnes-video-2.5-flash"
+
+
+def test_audio_prefers_local_sapi_without_cloud_speech_credentials(monkeypatch):
+    from generation.services import model_resolve
+
+    monkeypatch.setattr(model_resolve.settings, "environment", "development")
+    monkeypatch.setattr(model_resolve.settings, "speech_app_id", "")
+    monkeypatch.setattr(model_resolve.settings, "speech_token", "")
+
+    assert model_resolve._preferred_name("audio") == "local-sapi-tts"

@@ -385,3 +385,18 @@ export function shouldRefreshCanvas(ev: Record<string, unknown>): boolean {
   }
   return false
 }
+
+const CANVAS_MUTATION_TOOLS = new Set([
+  'create_nodes',
+  'connect_nodes',
+  'layout_nodes',
+  'update_node_config',
+  'delete_nodes',
+])
+
+export function shouldRefreshCanvasEvent(ev: Record<string, unknown>): boolean {
+  if (shouldRefreshCanvas(ev)) return true
+  if (ev.type !== 'tool_completed') return false
+  const data = (ev.data || {}) as Record<string, unknown>
+  return data.ok !== false && CANVAS_MUTATION_TOOLS.has(String(data.tool || ''))
+}

@@ -5,7 +5,6 @@ export * from "./domain/drama-state.ts";
 export * from "./infrastructure/database.ts";
 export * from "./infrastructure/nacos.ts";
 export * from "./infrastructure/pg-drama-state-store.ts";
-export * from "./infrastructure/schema.ts";
 export * from "./infrastructure/tool-gateway.ts";
 export * from "./pi/drama-agent.ts";
 export * from "./pi/system-prompt.ts";

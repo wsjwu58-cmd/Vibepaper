@@ -6,6 +6,9 @@ import os
 import random
 import shutil
 import subprocess
+import hashlib
+import json
+import wave
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,24 +160,116 @@ def first_reference_image(params: dict) -> str | None:
 
 # 旧方舟 / Mock 别名 → Agnes 正式模型名
 IMAGE_MODEL_ALIASES: dict[str, str] = {
-    "seedream-4": "agnes-image-2.1-flash",
-    "flux-dev": "agnes-image-2.1-flash",
-    "sd3-medium": "agnes-image-2.1-flash",
-    "doubao-seedream-5-0-260128": "agnes-image-2.1-flash",
-    "doubao-seedream-4-0-250828": "agnes-image-2.1-flash",
-    "doubao-seedream-4-5-251128": "agnes-image-2.1-flash",
+    "agnes-image-2.1-flash": "agnes-image-2.5-flash",
+    "seedream-4": "agnes-image-2.5-flash",
+    "flux-dev": "agnes-image-2.5-flash",
+    "sd3-medium": "agnes-image-2.5-flash",
+    "doubao-seedream-5-0-260128": "agnes-image-2.5-flash",
+    "doubao-seedream-4-0-250828": "agnes-image-2.5-flash",
+    "doubao-seedream-4-5-251128": "agnes-image-2.5-flash",
 }
 
 VIDEO_MODEL_ALIASES: dict[str, str] = {
-    "seedance-1.0": "agnes-video-v2.0",
-    "seedance-1.5": "agnes-video-v2.0",
-    "wan-2.1": "agnes-video-v2.0",
-    "kling-2.0": "agnes-video-v2.0",
-    "doubao-seedance-1-5-pro-251215": "agnes-video-v2.0",
-    "doubao-seedance-1-0-pro-250528": "agnes-video-v2.0",
-    "doubao-seedance-2-0-mini-260615": "agnes-video-v2.0",
-    "doubao-seedance-2-0-260128": "agnes-video-v2.0",
+    "seedance-1.0": "agnes-video-2.5-flash",
+    "seedance-1.5": "agnes-video-2.5-flash",
+    "wan-2.1": "agnes-video-2.5-flash",
+    "kling-2.0": "agnes-video-2.5-flash",
+    "doubao-seedance-1-5-pro-251215": "agnes-video-2.5-flash",
+    "doubao-seedance-1-0-pro-250528": "agnes-video-2.5-flash",
+    "doubao-seedance-2-0-mini-260615": "agnes-video-2.5-flash",
+    "doubao-seedance-2-0-260128": "agnes-video-2.5-flash",
 }
+
+
+def build_agnes_image_payload(params: dict) -> dict:
+    """构造 Agnes Image 2.5 Flash 的稳定请求合同。"""
+    prompt = build_generation_prompt(params)
+    if not prompt:
+        raise ValueError("图片生成需要 prompt")
+    model = resolve_image_model(str(params.get("model") or "agnes-image-2.5-flash"))
+    size, ratio = _agnes_image_size_and_ratio(params)
+    body: dict = {"model": model, "prompt": prompt[:2000], "size": size, "ratio": ratio}
+    extra_body: dict = {"response_format": "url"}
+    images: list[str] = []
+    primary = first_reference_image(params)
+    if primary:
+        images.append(_media_url_for_remote_api(str(primary)))
+    for key in ("referenceImages", "reference_images", "referenceUrls"):
+        for item in _normalize_str_list(params.get(key)):
+            media = _media_url_for_remote_api(item)
+            if media and media not in images:
+                images.append(media)
+    if images:
+        extra_body["image"] = images
+    body["extra_body"] = extra_body
+    return body
+
+
+def build_agnes_video_payload(params: dict) -> dict:
+    """构造 Agnes Video 2.5 Flash 请求合同，禁止混入 V2.0 帧数参数。"""
+    prompt = build_generation_prompt(params)
+    if not prompt:
+        raise ValueError("视频生成需要 prompt")
+    explicit_size = str(params.get("size") or "").strip().upper()
+    if explicit_size and explicit_size != "720P":
+        raise ValueError("Agnes Video 2.5 Flash 仅支持 720P")
+    raw_seconds = params.get("seconds", params.get("duration", 5))
+    try:
+        seconds = int(float(raw_seconds))
+    except (TypeError, ValueError) as error:
+        raise ValueError("视频 seconds 必须是整数") from error
+    if seconds < 4 or seconds > 12:
+        raise ValueError("视频 seconds 必须在 4 到 12 秒之间")
+
+    first = params.get("firstFrameUrl")
+    last = params.get("lastFrameUrl")
+    refs = _normalize_str_list(
+        params.get("referenceImages")
+        or params.get("reference_images")
+        or params.get("referenceUrls")
+    )
+    if len(refs) > 5:
+        raise ValueError("Agnes Video 2.5 Flash 最多支持 5 张参考图")
+
+    model = resolve_video_model(str(params.get("model") or "agnes-video-2.5-flash"))
+    if isinstance(first, str) and first.strip():
+        mode = "keyframe"
+        images = [_media_url_for_remote_api(first.strip())]
+        if isinstance(last, str) and last.strip():
+            images.append(_media_url_for_remote_api(last.strip()))
+        extra_body = {"image": images, "mode": "keyframes"}
+    elif refs:
+        mode = "reference"
+        extra_body = {"image": [_media_url_for_remote_api(item) for item in refs], "mode": "reference"}
+    else:
+        mode = "text"
+        extra_body = None
+
+    body: dict = {
+        "model": model,
+        "mode": mode,
+        "prompt": prompt[:2000],
+        "size": "720P",
+        "seconds": str(seconds),
+        "n": 1,
+    }
+    aspect_ratio = str(params.get("aspect_ratio") or params.get("aspectRatio") or params.get("ratio") or "").strip()
+    if aspect_ratio:
+        if aspect_ratio not in {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}:
+            raise ValueError("视频 aspect_ratio 无效")
+        body["aspect_ratio"] = aspect_ratio
+    if extra_body:
+        body["extra_body"] = extra_body
+    return body
+
+
+def build_agnes_video_poll_url(video_id: str, model_name: str) -> str:
+    """生成带 model_name 的 Agnes 视频状态查询 URL。"""
+    from urllib.parse import urlencode
+
+    return "https://apihub.agnes-ai.com/agnesapi?" + urlencode(
+        {"video_id": str(video_id), "model_name": str(model_name)}
+    )
 
 
 def resolve_image_model(model_name: str | None) -> str:
@@ -183,16 +278,18 @@ def resolve_image_model(model_name: str | None) -> str:
         return IMAGE_MODEL_ALIASES[raw]
     if raw.startswith("agnes-image"):
         return raw
-    return raw or settings.agnes_image_model or "agnes-image-2.1-flash"
+    return raw or settings.agnes_image_model or "agnes-image-2.5-flash"
 
 
 def resolve_video_model(model_name: str | None) -> str:
     raw = (model_name or "").strip()
     if raw in VIDEO_MODEL_ALIASES:
         return VIDEO_MODEL_ALIASES[raw]
+    if raw == "agnes-video-v2.0":
+        return "agnes-video-2.5-flash"
     if raw.startswith("agnes-video"):
         return raw
-    return raw or settings.agnes_video_model or "agnes-video-v2.0"
+    return raw or settings.agnes_video_model or "agnes-video-2.5-flash"
 
 
 def _agnes_frames_for_duration(seconds: int, fps: int = 24) -> int:
@@ -202,15 +299,19 @@ def _agnes_frames_for_duration(seconds: int, fps: int = 24) -> int:
     return min(441, 8 * n + 1)
 
 
-def _httpx_retry_429(request_fn, *, attempts: int = 4, first_delay: float = 2.0):
-    """Agnes 创建接口遇 429 时退避重试，避免立刻失败。"""
+def _httpx_retry_429(request_fn, *, attempts: int = 5, first_delay: float = 3.0):
+    """Agnes 创建接口遇限流或临时拥塞时退避重试。
+
+    Agnes 在文本生图队列满时会返回 503（而不是 429）；这属于
+    可恢复的供应商瞬态错误，不能直接把本次任务判成模型不可用。
+    """
     import time
 
     delay = first_delay
     last = None
     for _ in range(max(1, attempts)):
         last = request_fn()
-        if getattr(last, "status_code", 0) != 429:
+        if getattr(last, "status_code", 0) not in {429, 502, 503, 504}:
             return last
         time.sleep(delay)
         delay = min(delay * 2, 30)
@@ -234,6 +335,37 @@ def _agnes_wh_from_params(params: dict) -> tuple[int, int]:
         "3:4": (768, 1024),
     }
     return mapping.get(ratio, (1152, 768))
+
+
+def _agnes_image_size_and_ratio(params: dict) -> tuple[str, str]:
+    explicit = str(params.get("size") or "").strip().upper()
+    ratio = str(params.get("ratio") or params.get("aspectRatio") or "").strip()
+    resolution = str(params.get("resolution") or "").strip()
+    if not ratio and "x" in resolution.lower():
+        try:
+            w, h = (int(x) for x in resolution.lower().split("x", 1))
+            if w == h:
+                ratio = "1:1"
+            elif w > h:
+                ratio = "16:9" if w / h > 1.4 else "4:3"
+            else:
+                ratio = "9:16" if h / w > 1.4 else "3:4"
+        except Exception:
+            ratio = "1:1"
+    ratio = ratio or "1:1"
+    if ratio not in {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2"}:
+        raise ValueError("图片 ratio 无效")
+    if explicit in {"1K", "2K", "3K", "4K"}:
+        return explicit, ratio
+    mapping = {
+        "512x512": "1K",
+        "768x768": "1K",
+        "1024x1024": "1K",
+        "1280x720": "2K",
+        "1920x1080": "2K",
+        "3840x2160": "4K",
+    }
+    return mapping.get(resolution, settings.agnes_image_size or "2K"), ratio
 
 
 def parse_ark_http_error(response) -> tuple[str, str]:
@@ -696,6 +828,168 @@ class MockVideoProvider(ModelProvider):
         return ProviderJob(job_id=f"vid-{request.task_id}", status="succeeded", result={"outputs": outputs})
 
 
+class WindowsSapiTtsProvider(ModelProvider):
+    """Development-only offline TTS backed by Windows System.Speech.
+
+    The spoken text and output path are sent over stdin as JSON so neither
+    user content nor credentials appear in the process command line.
+    """
+
+    name = "local-sapi-tts"
+    _MAX_TEXT_LENGTH = 20_000
+    _TONE_VOLUME = {"neutral": 100, "calm": 88, "warm": 94, "energetic": 100}
+
+    def normalized_params(self, params: dict) -> dict:
+        text = build_generation_prompt(params) or str(params.get("text") or "").strip()
+        voice = str(params.get("voice") or "female").strip().lower()
+        language = str(params.get("language") or ("zh-CN" if any("\u4e00" <= c <= "\u9fff" for c in text) else "en-US"))
+        try:
+            speed = float(params.get("speed", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = max(0.5, min(speed, 2.0))
+        # SAPI uses an integer -10..10 rate. Logarithmic mapping keeps the
+        # documented 0.5x and 2.0x boundaries symmetric.
+        import math
+
+        rate = max(-10, min(10, int(round(math.log2(speed) * 5))))
+        tone = str(params.get("tone") or "neutral").strip().lower()
+        return {
+            "text": text,
+            "voice": voice,
+            "language": language,
+            "rate": rate,
+            "volume": self._TONE_VOLUME.get(tone, 100),
+            "tone": tone,
+            "toneApplied": tone in self._TONE_VOLUME,
+            "textHash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+
+    @staticmethod
+    def _wave_meta(path: Path) -> tuple[int, int]:
+        with wave.open(str(path), "rb") as audio:
+            sample_rate = audio.getframerate()
+            duration_ms = int(round(audio.getnframes() * 1000 / max(sample_rate, 1)))
+        return duration_ms, sample_rate
+
+    def generate(self, request: GenerationRequest) -> ProviderJob:
+        if os.name != "nt":
+            return ProviderJob(
+                job_id=f"sapi-platform-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message="local-sapi-tts 仅支持 Windows 开发环境",
+            )
+
+        normalized = self.normalized_params(request.params)
+        text = str(normalized["text"])
+        if not text:
+            return ProviderJob(
+                job_id=f"sapi-empty-{request.task_id}",
+                status="failed",
+                error_code="INVALID_INPUT",
+                error_message="语音合成需要非空文本",
+            )
+        if len(text) > self._MAX_TEXT_LENGTH:
+            return ProviderJob(
+                job_id=f"sapi-long-{request.task_id}",
+                status="failed",
+                error_code="INVALID_INPUT",
+                error_message=f"语音合成文本不能超过 {self._MAX_TEXT_LENGTH} 字符",
+            )
+
+        out_dir = Path(request.output_dir)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "tts.wav"
+            if out_path.is_file() and out_path.stat().st_size > 44:
+                duration_ms, sample_rate = self._wave_meta(out_path)
+                selected_voice = str(request.params.get("voiceId") or normalized["voice"])
+            else:
+                powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+                if not powershell:
+                    raise RuntimeError("找不到 Windows PowerShell")
+                script = r'''
+$ErrorActionPreference = 'Stop'
+$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+  $culture = New-Object System.Globalization.CultureInfo([string]$payload.language)
+  $gender = if ([string]$payload.voice -match 'male|男') {
+    [System.Speech.Synthesis.VoiceGender]::Male
+  } else {
+    [System.Speech.Synthesis.VoiceGender]::Female
+  }
+  try { $synth.SelectVoiceByHints($gender, [System.Speech.Synthesis.VoiceAge]::Adult, 0, $culture) } catch { }
+  $synth.Rate = [int]$payload.rate
+  $synth.Volume = [int]$payload.volume
+  $synth.SetOutputToWaveFile([string]$payload.outputPath)
+  $synth.Speak([string]$payload.text)
+  $name = $synth.Voice.Name
+  [Console]::Out.Write(($name | ConvertTo-Json -Compress))
+} finally {
+  $synth.Dispose()
+}
+'''
+                payload = {**normalized, "outputPath": str(out_path)}
+                proc = subprocess.run(
+                    [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                    input=json.dumps(payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+                if proc.returncode != 0:
+                    message = (proc.stderr or "Windows SAPI 执行失败").strip().splitlines()[-1]
+                    raise RuntimeError(message[:300])
+                if not out_path.is_file() or out_path.stat().st_size <= 44:
+                    raise RuntimeError("Windows SAPI 未生成有效 WAV")
+                duration_ms, sample_rate = self._wave_meta(out_path)
+                try:
+                    selected_voice = str(json.loads(proc.stdout.strip() or '""'))
+                except json.JSONDecodeError:
+                    selected_voice = str(normalized["voice"])
+
+            return ProviderJob(
+                job_id=f"sapi-{request.task_id}",
+                status="succeeded",
+                result={
+                    "outputs": [{
+                        "url": f"/api/v1/tasks/{request.task_id}/outputs/file/{out_path.name}",
+                        "file_path": str(out_path),
+                        "content_type": "audio/wav",
+                        "meta": {
+                            "index": 0,
+                            "outputType": "audio",
+                            "voiceId": selected_voice,
+                            "language": normalized["language"],
+                            "rate": normalized["rate"],
+                            "toneApplied": normalized["toneApplied"],
+                            "textHash": normalized["textHash"],
+                            "durationMs": duration_ms,
+                            "sampleRate": sample_rate,
+                            "provider": self.name,
+                        },
+                    }],
+                },
+            )
+        except subprocess.TimeoutExpired:
+            return ProviderJob(
+                job_id=f"sapi-timeout-{request.task_id}",
+                status="failed",
+                error_code="MODEL_TIMEOUT",
+                error_message="Windows SAPI 语音合成超时",
+            )
+        except Exception as error:
+            return ProviderJob(
+                job_id=f"sapi-error-{request.task_id}",
+                status="failed",
+                error_code="MEDIA_PROCESSING_FAILED",
+                error_message=f"Windows SAPI 语音合成失败：{str(error)[:300]}",
+            )
+
+
 class MockAudioProvider(ModelProvider):
     name = "mock-audio"
 
@@ -836,9 +1130,9 @@ class VolcengineArkImageProvider(ModelProvider):
         else:
             model = settings.ark_image_model or "doubao-seedream-5-0-260128"
         prompt = build_generation_prompt(request.params)
-        if operation == "扩图":
+        if operation in {"扩图", "outpaint_image"}:
             prompt = (prompt or "扩展画面边缘，保持主体完整") + "，outpainting，扩图"
-        elif operation == "超分":
+        elif operation in {"超分", "upscale_image"}:
             prompt = (prompt or "提升清晰度与细节") + "，高清超分，保留原构图"
         if request.params.get("style"):
             prompt = f"{prompt}\n风格：{request.params.get('style')}"
@@ -865,7 +1159,7 @@ class VolcengineArkImageProvider(ModelProvider):
             image = refs[0]
         if image:
             body["image"] = _media_url_for_remote_api(str(image))
-        if operation in {"扩图", "超分"} and not image:
+        if operation in {"扩图", "outpaint_image", "超分", "upscale_image"} and not image:
             # 无参考图时仍可文生图，但提示调用方
             pass
 
@@ -1249,9 +1543,9 @@ class AgnesImageProvider(ModelProvider):
 
         model = resolve_image_model(request.model_name)
         prompt = build_generation_prompt(request.params)
-        if operation == "扩图":
+        if operation in {"扩图", "outpaint_image"}:
             prompt = (prompt or "扩展画面边缘，保持主体完整") + "，outpainting，扩图"
-        elif operation == "超分":
+        elif operation in {"超分", "upscale_image"}:
             prompt = (prompt or "提升清晰度与细节") + "，高清超分，保留原构图"
         if request.params.get("style"):
             prompt = f"{prompt}\n风格：{request.params.get('style')}"
@@ -1263,26 +1557,7 @@ class AgnesImageProvider(ModelProvider):
                 error_message="图片生成需要 prompt",
             )
 
-        size, ratio = self._size_and_ratio(request.params)
-        body: dict = {
-            "model": model,
-            "prompt": prompt[:2000],
-            "size": size,
-            "ratio": ratio,
-            "extra_body": {"response_format": "url"},
-        }
-
-        images: list[str] = []
-        primary = first_reference_image(request.params)
-        if primary:
-            images.append(_media_url_for_remote_api(str(primary)))
-        for key in ("referenceImages", "reference_images", "referenceUrls"):
-            for item in _normalize_str_list(request.params.get(key)):
-                media = _media_url_for_remote_api(item)
-                if media and media not in images:
-                    images.append(media)
-        if images:
-            body["extra_body"]["image"] = images
+        body = build_agnes_image_payload({**request.params, "model": model, "prompt": prompt})
 
         count = max(1, min(int(request.params.get("count", 1)), 4))
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -1414,59 +1689,10 @@ class AgnesVideoProvider(ModelProvider):
         if request.params.get("style"):
             text = f"{text}\n风格：{request.params.get('style')}"
 
-        duration = int(request.params.get("duration") or settings.agnes_video_duration or 5)
-        duration = max(2, min(duration, 18))
-        fps = int(request.params.get("frame_rate") or request.params.get("fps") or 24)
-        fps = max(1, min(fps, 60))
-        num_frames = int(request.params.get("num_frames") or _agnes_frames_for_duration(duration, fps))
-        width, height = _agnes_wh_from_params(request.params)
-
-        body: dict = {
-            "model": model,
-            "prompt": text[:2000],
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": fps,
-        }
-        if request.params.get("negative_prompt"):
-            body["negative_prompt"] = str(request.params.get("negative_prompt"))
-        if request.params.get("seed") is not None:
-            try:
-                body["seed"] = int(request.params.get("seed"))
-            except (TypeError, ValueError):
-                pass
-
-        first = request.params.get("firstFrameUrl")
-        last = request.params.get("lastFrameUrl")
-        ref_urls = _normalize_str_list(
-            request.params.get("referenceUrls")
-            or request.params.get("referenceImages")
-            or request.params.get("reference_images"),
-        )
-        single = first_reference_image(request.params)
-        keyframe_urls: list[str] = []
-        if isinstance(first, str) and first.strip():
-            keyframe_urls.append(_media_url_for_remote_api(first.strip()))
-        if isinstance(last, str) and last.strip():
-            media = _media_url_for_remote_api(last.strip())
-            if media not in keyframe_urls:
-                keyframe_urls.append(media)
-        if len(keyframe_urls) >= 2 or str(request.params.get("mode") or "") == "keyframes":
-            body["extra_body"] = {"image": keyframe_urls or [_media_url_for_remote_api(u) for u in ref_urls[:2]], "mode": "keyframes"}
-        elif single:
-            body["image"] = _media_url_for_remote_api(str(single))
-            body["mode"] = "ti2vid"
-        elif ref_urls:
-            body["image"] = _media_url_for_remote_api(ref_urls[0])
-            body["mode"] = "ti2vid"
+        body = build_agnes_video_payload({**request.params, "model": model, "prompt": text})
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         base = settings.agnes_base_url.rstrip("/")
-        # 轮询入口在 /v1 之外：https://apihub.agnes-ai.com/agnesapi
-        poll_root = base[:-3] if base.endswith("/v1") else base.rsplit("/v1", 1)[0]
-        if not poll_root:
-            poll_root = "https://apihub.agnes-ai.com"
 
         try:
             with httpx.Client(timeout=60.0) as client:
@@ -1501,11 +1727,7 @@ class AgnesVideoProvider(ModelProvider):
                 time.sleep(poll_interval)
                 while time.time() < deadline:
                     if video_id:
-                        poll = client.get(
-                            f"{poll_root}/agnesapi",
-                            headers=headers,
-                            params={"video_id": video_id, "model_name": model},
-                        )
+                        poll = client.get(build_agnes_video_poll_url(str(video_id), model), headers=headers)
                     else:
                         poll = client.get(f"{base}/videos/{task_id}", headers=headers)
                     if poll.status_code == 429:
@@ -1848,6 +2070,7 @@ PROVIDER_REGISTRY: dict[str, ModelProvider] = {
     "mock-image": MockImageProvider(),
     "mock-video": MockVideoProvider(),
     "mock-audio": MockAudioProvider(),
+    "local-sapi-tts": WindowsSapiTtsProvider(),
     "doubao-tts": DoubaoTtsProvider(),
     "mock-compose": ComposeProvider(),
     "mock-director": MockDirectorProvider(),
@@ -1871,6 +2094,9 @@ PROVIDER_REGISTRY: dict[str, ModelProvider] = {
 def get_provider(provider_name: str, model_type: str | None = None) -> ModelProvider:
     modality = (model_type or "").lower()
     pname = (provider_name or "").lower()
+
+    if pname == "local-sapi-tts":
+        return PROVIDER_REGISTRY["local-sapi-tts"]
 
     if "agnes-video" in pname or pname == "agnes-video":
         return PROVIDER_REGISTRY["agnes-video"]

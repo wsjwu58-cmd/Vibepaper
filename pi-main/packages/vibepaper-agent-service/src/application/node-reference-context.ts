@@ -96,7 +96,10 @@ function snapshotFromNode(id: string, node: Record<string, unknown>): NodeRefere
 	const nodeType = boundedString(node.type, MAX_LABEL_LENGTH) ?? "unknown";
 	const creativeType = boundedString(node.creativeType, MAX_LABEL_LENGTH);
 	const title =
-		boundedString(params.title, MAX_LABEL_LENGTH) ?? creativeType ?? boundedString(node.type, MAX_LABEL_LENGTH) ?? "节点";
+		boundedString(params.title, MAX_LABEL_LENGTH) ??
+		creativeType ??
+		boundedString(node.type, MAX_LABEL_LENGTH) ??
+		"节点";
 	const status = boundedString(node.status, MAX_LABEL_LENGTH) ?? "ready";
 	const textContent = firstBoundedString(
 		[output.text, output.content, params.lastOutputText, params.content, params.text],

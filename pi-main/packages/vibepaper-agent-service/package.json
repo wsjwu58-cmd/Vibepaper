@@ -16,6 +16,7 @@
 		"start": "node dist/server.js",
 		"dev": "tsx src/server.ts",
 		"generate:skills": "node scripts/generate-skill-manifest.mjs ../../../skills/skills.md",
+		"eval": "tsx evals/run-evals.ts",
 		"migrate": "tsx src/migrate.ts",
 		"test": "vitest --run"
 	},
