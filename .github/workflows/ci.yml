@@ -33,8 +33,8 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build Pi core packages
         run: |
-          npm run build:offline --workspace=@earendil-works/pi-ai
-          npm run build --workspace=@earendil-works/pi-agent-core
+          npx tsgo -p packages/ai/tsconfig.build.json
+          npx tsgo -p packages/agent/tsconfig.build.json
       - name: Biome lint
         run: npx biome check packages/vibepaper-agent-service/src packages/vibepaper-agent-service/test
       - name: Typecheck
