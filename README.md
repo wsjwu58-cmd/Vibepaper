@@ -10,6 +10,15 @@
 
 ---
 
+## 分支说明
+
+| 分支 | 定位 |
+|------|------|
+| `dev` | 默认分支；集成最新的 Node.js + Pi Agent Core 版本及全栈开发改动 |
+| `main` | Python 版本分支；保留 `agent-service` 与 `generation-service` 的 Python 运行基线 |
+
+---
+
 ## 功能概览
 
 | 能力 | 说明 |
