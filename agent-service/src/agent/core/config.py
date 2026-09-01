@@ -10,8 +10,10 @@ class Settings(BaseSettings):
     app_name: str = "agent-service"
     port: int = 8091
     environment: str = "development"
-    database_url: str = ""
-    redis_url: str = ""
+    # Safe development/test defaults keep module import and unit collection
+    # independent from local infrastructure; deployments override both via env.
+    database_url: str = "sqlite:///./vibepaper_agent.db"
+    redis_url: str = "redis://localhost:6379/5"
     canvas_base_url: str = "http://localhost:8082"
     asset_base_url: str = "http://localhost:8083"
     billing_base_url: str = "http://localhost:8084"

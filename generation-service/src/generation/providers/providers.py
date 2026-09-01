@@ -873,14 +873,6 @@ class WindowsSapiTtsProvider(ModelProvider):
         return duration_ms, sample_rate
 
     def generate(self, request: GenerationRequest) -> ProviderJob:
-        if os.name != "nt":
-            return ProviderJob(
-                job_id=f"sapi-platform-{request.task_id}",
-                status="failed",
-                error_code="MODEL_UNAVAILABLE",
-                error_message="local-sapi-tts 仅支持 Windows 开发环境",
-            )
-
         normalized = self.normalized_params(request.params)
         text = str(normalized["text"])
         if not text:
@@ -896,6 +888,13 @@ class WindowsSapiTtsProvider(ModelProvider):
                 status="failed",
                 error_code="INVALID_INPUT",
                 error_message=f"语音合成文本不能超过 {self._MAX_TEXT_LENGTH} 字符",
+            )
+        if os.name != "nt":
+            return ProviderJob(
+                job_id=f"sapi-platform-{request.task_id}",
+                status="failed",
+                error_code="MODEL_UNAVAILABLE",
+                error_message="local-sapi-tts 仅支持 Windows 开发环境",
             )
 
         out_dir = Path(request.output_dir)
