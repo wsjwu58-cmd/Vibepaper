@@ -1,10 +1,23 @@
+<div align="center">
+
 # VibePaper
 
-个人独立开发的 **AI 原生节点化无限画布** 创作平台。
+**AI 原生节点化无限画布创作平台**
 
-以无限画布为容器、以节点承载文本 / 图片 / 视频 / 音频，通过连线建立引用关系，由 Agent 驱动编排，并用点数计费闭环支撑创作全流程：
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![React](https://img.shields.io/badge/React_19-61DAFB?logo=react&logoColor=white)](https://react.dev)
+[![Java](https://img.shields.io/badge/Java_21-Spring_Boot_3-6DB33F?logo=springboot&logoColor=white)](https://spring.io)
+[![FastAPI](https://img.shields.io/badge/FastAPI-Python_3.12-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Node.js](https://img.shields.io/badge/Node.js_22-Pi_Agent_Core-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![Docker](https://img.shields.io/badge/Docker-部署-2496ED?logo=docker&logoColor=white)](#docker-部署推荐)
+
+以无限画布为容器、以节点承载文本 / 图片 / 视频 / 音频，连线建立引用关系，Agent 驱动编排，点数计费闭环支撑创作全流程：
 
 **创意 → 生成 → 编辑 → 组合 → 导出**
+
+<img src="docs/images/screenshot.png" alt="VibePaper 界面截图" width="880">
+
+</div>
 
 > 本仓库为个人学习与实践项目，持续迭代中。目标是对齐并实现 vibepaper-ai.com 的已确认产品能力与关键交互（不含商标、受版权素材与私有算法）。
 
@@ -74,13 +87,55 @@ generation-service/    # Python 生成服务
 pi-main/                # 锁定的 Pi 上游源码与 VibePaper Agent 工作区
   packages/vibepaper-agent-service/  # Node.js + Pi 的 Agent 服务
 vibepaper-web/         # React 前端
-deploy/                # 一键启停与 compose
+deploy/                # 一键启停与基础设施
+Dockerfile             # 多阶段构建（web / java / generation / agent）
+docker-compose.yml     # 全栈一键部署
 AGENTS.md              # Agent / 协作者工程契约
 ```
 
 ---
 
 ## 快速开始
+
+### Docker 部署（推荐）
+
+根目录提供了 [`Dockerfile`](./Dockerfile)（多阶段构建：前端 / Java 服务 / 生成服务 / Agent 服务）与 [`docker-compose.yml`](./docker-compose.yml)，一条命令拉起全栈：
+
+```bash
+docker compose up -d --build
+```
+
+启动内容：
+
+| 类别 | 服务 |
+|------|------|
+| 基础设施 | PostgreSQL 18 · Redis 7 · Nacos |
+| Java 微服务 | gateway(8080) · identity(8081) · canvas(8082) · asset(8083) · billing(8084) · enterprise(8085) · gallery(8086) · admin(8087) |
+| 生成服务 | generation-service（FastAPI, 8090） |
+| Agent 服务 | agent-service（Node.js + Pi Agent Core, 8091） |
+| 前端 | vibepaper-web（Nginx, http://localhost:5173） |
+
+需要真实生成能力时，在启动前设置模型 API Key（Agnes 兼容接口）：
+
+```bash
+VIBEPAPER_LLM_API_KEY=your_key VIBEPAPER_AGNES_API_KEY=your_key docker compose up -d --build
+```
+
+常用命令：
+
+```bash
+docker compose ps                # 查看状态
+docker compose logs -f agent-service   # 跟踪某个服务日志
+docker compose down              # 停止（保留数据卷）
+docker compose down -v           # 停止并清空数据卷
+```
+
+说明：
+
+- 数据库通过 `deploy/init-db.sql` 首次启动自动建库；Java 服务由 Flyway 自动建表。
+- 生成服务默认 `inline` 执行器，不需要 RocketMQ；如需 MQ / MinIO，可参考 `deploy/docker-compose.yml` 单独启动基础设施。
+- Agent 确认令牌签名密钥等敏感配置通过环境变量注入（`VIBEPAPER_CONFIRM_SIGNING_SECRET`、`VIBEPAPER_INTERNAL_SERVICE_TOKEN`），请勿写入仓库。
+- 仅构建单个镜像：`docker build --target web -t vibepaper-web .`（`web` / `java` / `generation` / `agent` 四个 target）。
 
 ### 环境要求
 
